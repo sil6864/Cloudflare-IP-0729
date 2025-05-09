@@ -1231,6 +1231,11 @@ def main() -> None:
             logging.info(f"[EXCLUDE] URL {url} 排除了 {excluded_in_source} 个IP，保留 {len(retained_ips)} 个IP")
         excluded_count += excluded_in_source
         logging.info(f"URL {url} 贡献了 {len(retained_ips)} 个IP")
+        # 新增：日志输出每个URL最终筛选出来的IP（前20个）
+        if len(retained_ips) > 20:
+            logging.info(f"[RESULT] URL {url} 最终筛选IP（前20个）: {retained_ips[:20]} ... 共{len(retained_ips)}个")
+        else:
+            logging.info(f"[RESULT] URL {url} 最终筛选IP: {retained_ips}")
         merged_ips.extend(retained_ips)
 
     final_all_ips = list(dict.fromkeys(merged_ips))
