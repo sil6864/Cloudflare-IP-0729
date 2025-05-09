@@ -1,3 +1,44 @@
+name: Update IP List
+
+on:
+  schedule:
+    - cron: '0 */8 * * *' # 每8小时运行一次
+  workflow_dispatch: # 允许手动触发
+  push: # 允许提交触发
+
+jobs:
+  update-ip-list:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install
+
+      - name: Run script
+        run: |
+          set -e
+          python fetch_cloudflare_ips.py
+
       - name: Commit and push changes
         run: |
-          echo "Testing commit step"
+          echo "Line 1 of test"
+          echo "Line 2 of test"
+          echo "Line 3 of test"
+          echo "Line 4 of test"
+          echo "Line 5 of test"
+          echo "Line 6 of test"
+          echo "Line 7 of test"
+          echo "Line 8 of test"
+          echo "Line 9 of test - End"
