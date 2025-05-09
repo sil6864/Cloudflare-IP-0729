@@ -52,8 +52,14 @@ jobs:
         git config --global user.email "tianshideyou@proton.me"
         git config --global user.name "tianshipapa"
         git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
-        if [ -n "$(git status --porcelain)" ]; then git add ip.txt && git commit -m "Automatic update" && git push; else echo "No changes detected, skipping commit."; fi 
+        if [ -n "$(git status --porcelain)" ]; then
+          git add ip.txt
+          git commit -m "Automatic update"
+          git pull --rebase origin main
+          git push
+        else
+          echo "No changes detected, skipping commit."
+        fi 
 
 permissions:
   contents: write 
-  
