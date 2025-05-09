@@ -9,7 +9,7 @@ sources:  # 需要抓取的IP数据源列表。每项可为：
   - url: https://ip.164746.xyz
     selector: 'td.recommended'        # 优先提取td.recommended标签内的IP
   - url: https://www.nslookup.io/domains/bpb.yousef.isegaro.com/dns-records/#cloudflare
-    selector: 'span'        # 优先提取span标签内的IP
+    selector: 'td.py-1 span'        # 优先提取td.py-1 span标签内的IP
   - url: https://cf.090227.xyz
   - url: https://stock.hostmonit.com/CloudFlareYes
     # 未指定selector则自动智能识别
