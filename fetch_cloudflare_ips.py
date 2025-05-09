@@ -168,10 +168,24 @@ def fetch_ip_auto(
             page.set_extra_http_headers({"User-Agent": user_agent})
         except Exception:
             pass
+        found_ip_list = []
+        def handle_response(response):
+            try:
+                text = response.text()
+                ip_list = extract_ips(text, pattern)
+                if len(ip_list) >= 10:  # 阈值可调
+                    found_ip_list.extend(ip_list)
+            except Exception:
+                pass
+        page.on("response", handle_response)
         for attempt in range(1, js_retry + 1):
             try:
                 page.goto(url, timeout=30000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)
+                if found_ip_list:
+                    found_ip_list = list(dict.fromkeys(found_ip_list))
+                    logging.info(f"[AUTO] 监听接口自动提取到 {len(found_ip_list)} 个IP: {found_ip_list[:10]}")
+                    return found_ip_list
                 page_content = page.content()
                 if '<html' in page_content.lower():
                     soup = BeautifulSoup(page_content, 'html.parser')
