@@ -1,14 +1,10 @@
 # Cloudflare 优选IP自动抓取与更新
 
 ## 项目简介
-本项目每3小时自动抓取 Cloudflare 优选IP，生成 `ip.txt`，并通过 GitHub Actions 自动化更新。
+本项目每8小时自动抓取 Cloudflare 优选IP，生成 `ip.txt`，并通过 GitHub Actions 自动化更新。
 
 ## 主要功能
-- 定时抓取以下页面的 Cloudflare IP：
-  - https://monitor.gacjie.cn/page/cloudflare/ipv4.html
-  - https://ip.164746.xyz
-  - https://cf.090227.xyz（JS动态渲染）
-  - https://stock.hostmonit.com/CloudFlareYes（JS动态渲染）
+- 定时抓取页面的 Cloudflare IP：
 - 自动去重，保证IP唯一
 - 自动推送最新IP列表到仓库
 - 支持只保留指定地区（如中国大陆、香港等）的IP，地区和API可自定义
@@ -19,7 +15,7 @@
 - `.github/workflows/update-cloudflare-ip-list.yml`：GitHub Actions自动化配置
 - `README.md`：项目说明文档
 - `requirements.txt`：Python依赖包列表
-- `config.yaml`：业务参数配置文件
+- `config.yaml`：参数配置文件
 
 ## 依赖安装
 本地运行需先安装依赖：
@@ -70,7 +66,7 @@ ip_geo_api: "http://ip-api.com/json/{ip}"   # IP归属地API模板，{ip}会被�
 优先级：命令行参数 > 配置文件 > 默认值
 
 ## 自动化流程（GitHub Actions）
-- 每3小时自动运行脚本，抓取并更新IP列表
+- 每8小时自动运行脚本，抓取并更新IP列表
 - 自动安装 Playwright 及浏览器，支持 JS 动态页面抓取
 - 仅当`ip.txt`有变更时自动提交
 - 支持手动触发和push触发
@@ -79,26 +75,6 @@ ip_geo_api: "http://ip-api.com/json/{ip}"   # IP归属地API模板，{ip}会被�
 - 网络请求失败：请检查目标网站可用性或本地网络
 - 依赖缺失：请确保已正确安装 requirements.txt 中所有依赖，并已执行 `python -m playwright install`
 - 编码问题：脚本已指定utf-8编码，若仍有问题请反馈
-
-## 优化与更新说明
-- 2024-06：
-  - 脚本结构重构，增加异常处理、去重、日志输出、类型注解
-  - 支持 JS 动态页面抓取，集成 Playwright
-  - 依赖管理规范化，依赖迁移至 requirements.txt
-  - GitHub Actions 优化，自动安装 Playwright 及浏览器
-  - README.md 完善
-  - **2024-06-xx：**
-    - 全量类型注解覆盖，PEP8格式化，关键函数补充注释
-    - 细化网络、解析、文件写入等异常处理，提升健壮性
-    - 代码风格与规范全面提升，便于维护和扩展
-  - **2024-07-xx：**
-    - 添加 IP 数量限制功能，支持每个 URL 的 IP 数量上限设置
-    - 支持两种截取模式：随机和保留靠前
-    - 完善日志输出，清晰展示 IP 限制过程
-    - 添加 IP 排除功能，支持精确匹配和 CIDR 网段匹配
-    - 自动跳过排除列表中的 IP，提升结果质量
-    - 优化 `top` 模式的 IP 筛选逻辑，使其真正按照 IP 在源页面上的出现顺序（排名）进行选择，而非简单的字典序排序。
-    - 新增"只保留指定地区IP"功能，支持通过 allowed_regions 和 ip_geo_api 灵活配置地区过滤
 
 ## 其他说明
 - 如需扩展更多 JS 动态页面抓取，可参考 fetch_js_ips 函数实现
