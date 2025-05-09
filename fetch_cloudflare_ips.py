@@ -44,24 +44,31 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
             config = yaml.safe_load(f)
             if not isinstance(config, dict):
                 raise ValueError('config.yaml 格式错误，需为字典结构')
-            # 必须字段校验
             required = ['sources', 'pattern', 'output', 'timeout', 'log', 'max_workers', 'log_level', 'js_retry', 'js_retry_interval']
             for k in required:
                 if k not in config:
                     raise KeyError(f'config.yaml 缺少必需字段: {k}')
-            
-            # 新增配置项默认值
+            # 兼容sources为字符串或字典
+            new_sources = []
+            for item in config['sources']:
+                if isinstance(item, str):
+                    new_sources.append({'url': item, 'selector': None})
+                elif isinstance(item, dict):
+                    new_sources.append({'url': item['url'], 'selector': item.get('selector')})
+                else:
+                    raise ValueError('sources 列表元素必须为字符串或包含url/selector的字典')
+            config['sources'] = new_sources
+            # 其他默认值...（保持原有逻辑）
             if 'max_ips_per_url' not in config:
-                config['max_ips_per_url'] = 0  # 默认不限制
+                config['max_ips_per_url'] = 0
             if 'per_url_limit_mode' not in config:
-                config['per_url_limit_mode'] = 'random'  # 默认随机保留
+                config['per_url_limit_mode'] = 'random'
             if 'exclude_ips' not in config:
-                config['exclude_ips'] = []  # 默认不排除任何IP
-            # 新增地区过滤相关配置
+                config['exclude_ips'] = []
             if 'allowed_regions' not in config:
-                config['allowed_regions'] = []  # 默认不限制地区
+                config['allowed_regions'] = []
             if 'ip_geo_api' not in config:
-                config['ip_geo_api'] = ''  # 默认不查归属地
+                config['ip_geo_api'] = ''
             return config
     except Exception as e:
         raise RuntimeError(f"读取配置文件失败: {e}")
@@ -125,6 +132,44 @@ def get_retry_session(timeout: int) -> requests.Session:
     return session
 
 # ---------------- 智能抓取 ----------------
+def extract_ips_from_html(html: str, pattern: str, selector: str = None) -> List[str]:
+    """
+    智能提取IP，优先用selector，其次自动检测IP密集块，最后全局遍历。
+    :param html: 网页HTML
+    :param pattern: IP正则
+    :param selector: 可选，CSS选择器
+    :return: IP列表（顺序与页面一致）
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    # 1. 优先用selector
+    if selector:
+        selected = soup.select(selector)
+        if selected:
+            ip_list = []
+            for elem in selected:
+                ip_list.extend(re.findall(pattern, elem.get_text()))
+            if ip_list:
+                logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
+                return list(dict.fromkeys(ip_list))
+    # 2. 自动检测IP密集块
+    candidates = []
+    for tag in ['pre', 'code', 'table', 'div', 'section', 'article']:
+        for elem in soup.find_all(tag):
+            text = elem.get_text()
+            ips = re.findall(pattern, text)
+            if len(ips) >= 3:  # 至少3个IP才认为是候选
+                candidates.append((len(ips), ips))
+    if candidates:
+        candidates.sort(reverse=True)
+        ip_list = candidates[0][1]
+        logging.info(f"[EXTRACT] 自动检测到IP密集块({len(ip_list)}个IP, tag优先级)")
+        return list(dict.fromkeys(ip_list))
+    # 3. 全局遍历
+    all_text = soup.get_text()
+    ip_list = re.findall(pattern, all_text)
+    logging.info(f"[EXTRACT] 全局遍历提取到{len(ip_list)}个IP")
+    return list(dict.fromkeys(ip_list))
+
 def fetch_ip_auto(
     url: str,
     pattern: str,
@@ -132,7 +177,8 @@ def fetch_ip_auto(
     session: requests.Session,
     page: Optional[Page] = None,
     js_retry: int = 3,
-    js_retry_interval: float = 2.0
+    js_retry_interval: float = 2.0,
+    selector: str = None
 ) -> List[str]:
     logging.info(f"[AUTO] 正在抓取: {url}")
     extracted_ips: List[str] = []
@@ -141,26 +187,9 @@ def fetch_ip_auto(
         headers = {"User-Agent": user_agent}
         response = session.get(url, headers=headers)
         response.raise_for_status()
-        content_type = response.headers.get('Content-Type', '').lower()
         text = response.text
-        if 'text/html' in content_type or '<html' in text.lower():
-            soup = BeautifulSoup(text, 'html.parser')
-            ip_list: List[str] = []
-            table = soup.find('table')
-            if table:
-                for row in table.find_all('tr'):
-                    for cell in row.find_all('td'):
-                        ip_list.extend(extract_ips(cell.get_text(), pattern))
-            else:
-                elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-                for element in elements:
-                    ip_list.extend(extract_ips(element.get_text(), pattern))
-            extracted_ips = list(dict.fromkeys(ip_list))
-            logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {extracted_ips[:10]}")
-        else:
-            ip_list = extract_ips(text, pattern)
-            extracted_ips = list(dict.fromkeys(ip_list))
-            logging.info(f"[DEBUG] {url} 纯文本抓取前10个IP: {extracted_ips[:10]}")
+        extracted_ips = extract_ips_from_html(text, pattern, selector)
+        logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {extracted_ips[:10]}")
         if extracted_ips:
             logging.info(f"[AUTO] 静态抓取成功: {url}，共{len(extracted_ips)}个IP")
             return extracted_ips
@@ -226,13 +255,14 @@ def fetch_ip_auto(
         logging.error(f"[AUTO] 未提供page对象，无法进行JS动态抓取: {url}")
     return []
 
-async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession) -> tuple[str, List[str], bool]:
+async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession, selector: str = None) -> tuple[str, List[str], bool]:
     """
     异步静态页面抓取任务，返回(url, IP列表 (有序且唯一), 是否成功)。
     :param url: 目标URL
     :param pattern: IP正则
     :param timeout: 超时时间
     :param session: aiohttp.ClientSession
+    :param selector: 可选，CSS选择器
     :return: (url, IP列表 (有序且唯一), 是否成功)
     """
     try:
@@ -243,25 +273,8 @@ async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: a
                 logging.warning(f"[ASYNC] 静态抓取失败: {url}，HTTP状态码: {response.status}")
                 return (url, [], False)
             text = await response.text()
-            content_type = response.headers.get('Content-Type', '').lower()
-            if 'text/html' in content_type or '<html' in text.lower():
-                soup = BeautifulSoup(text, 'html.parser')
-                ip_list: List[str] = []
-                table = soup.find('table')
-                if table:
-                    for row in table.find_all('tr'):
-                        for cell in row.find_all('td'):
-                            ip_list.extend(extract_ips(cell.get_text(), pattern))
-                else:
-                    elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-                    for element in elements:
-                        ip_list.extend(extract_ips(element.get_text(), pattern))
-                ordered_unique_ips: List[str] = list(dict.fromkeys(ip_list))
-                logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {ordered_unique_ips[:10]}")
-            else:
-                ip_list = extract_ips(text, pattern)
-                ordered_unique_ips: List[str] = list(dict.fromkeys(ip_list))
-                logging.info(f"[DEBUG] {url} 纯文本抓取前10个IP: {ordered_unique_ips[:10]}")
+            ordered_unique_ips: List[str] = extract_ips_from_html(text, pattern, selector)
+            logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {ordered_unique_ips[:10]}")
             if ordered_unique_ips:
                 logging.info(f"[ASYNC] 静态抓取成功: {url}，共{len(ordered_unique_ips)}个IP")
                 return (url, ordered_unique_ips, True)
@@ -298,10 +311,10 @@ def limit_ips(ip_collection: Union[List[str], Set[str]], max_count: int, mode: s
         import random
         return random.sample(collection_list, max_count)
 
-async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, List[str]], List[str]]:
+async def async_static_crawl(sources: List[Dict[str, str]], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, List[str]], List[str]]:
     """
     并发抓取所有静态页面，返回每个URL的IP列表和需要JS动态抓取的URL。
-    :param sources: URL列表
+    :param sources: [{url, selector}]列表
     :param pattern: IP正则
     :param timeout: 超时时间
     :param max_ips: 每个URL最多保留的IP数量，0表示不限制
@@ -312,9 +325,9 @@ async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max
     need_js_urls: List[str] = []
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [fetch_ip_static_async(url, pattern, timeout, session) for url in sources]
+        tasks = [fetch_ip_static_async(item['url'], pattern, timeout, session, item.get('selector')) for item in sources]
         results = await asyncio.gather(*tasks)
-        for url, fetched_ip_list, success in results: # fetched_ip_list 是 List[str]
+        for url, fetched_ip_list, success in results:
             if success:
                 processed_ips_list: List[str]
                 if max_ips > 0 and len(fetched_ip_list) > max_ips:
@@ -457,7 +470,7 @@ def playwright_dynamic_fetch_worker(args):
     """
     单个线程任务：独立创建浏览器实例，抓取一个URL的动态IP。
     """
-    url, pattern, timeout, js_retry, js_retry_interval = args
+    url, pattern, timeout, js_retry, js_retry_interval, selector = args
     from playwright.sync_api import sync_playwright
     session = get_retry_session(timeout)
     result_ips = []
@@ -466,7 +479,7 @@ def playwright_dynamic_fetch_worker(args):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             try:
-                fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval, selector)
                 result_ips = fetched_ip_list_dynamic
             finally:
                 page.close()
@@ -486,7 +499,7 @@ def main() -> None:
     :return: None
     """
     config = load_config()
-    sources = config['sources']
+    sources = config['sources']  # [{url, selector}]
     pattern = config['pattern']
     output = config['output']
     timeout = config['timeout']
@@ -497,10 +510,9 @@ def main() -> None:
     js_retry_interval = config['js_retry_interval']
     max_ips_per_url = config['max_ips_per_url']
     per_url_limit_mode = config['per_url_limit_mode']
-    exclude_ips_config = config['exclude_ips'] # 重命名以区分函数
-    
+    exclude_ips_config = config['exclude_ips']
+
     setup_logging(log_file, log_level)
-    # 若输出文件已存在，先删除
     if os.path.exists(output):
         try:
             os.remove(output)
@@ -508,18 +520,19 @@ def main() -> None:
             logging.error(f"无法删除旧的输出文件: {output}，错误: {e}")
 
     url_ips_map: Dict[str, List[str]] = {}
-    need_js_urls: List[str] = []
+    need_js_urls: List[Dict[str, str]] = []
     try:
-        url_ips_map, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
+        url_ips_map, need_js_urls_raw = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
+        # need_js_urls_raw为url字符串列表，需转为[{url, selector}]
+        need_js_urls = [item for item in sources if item['url'] in need_js_urls_raw]
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
-    # 统一用多线程并发处理所有需要JS动态的url
     if need_js_urls:
         thread_num = min(4, len(need_js_urls))
         args_list = [
-            (url, pattern, timeout, js_retry, js_retry_interval)
-            for url in need_js_urls
+            (item['url'], pattern, timeout, js_retry, js_retry_interval, item.get('selector'))
+            for item in need_js_urls
         ]
         url_ips_map_dynamic = {}
         with ThreadPoolExecutor(max_workers=thread_num) as executor:
