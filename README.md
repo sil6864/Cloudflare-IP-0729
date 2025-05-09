@@ -4,11 +4,7 @@
 本项目每8小时自动抓取 Cloudflare 优选IP，生成 `ip.txt`，并通过 GitHub Actions 自动化更新。
 
 ## 主要功能
-- 定时抓取以下页面的 Cloudflare IP：
-  - https://monitor.gacjie.cn/page/cloudflare/ipv4.html
-  - https://ip.164746.xyz
-  - https://cf.090227.xyz（JS动态渲染）
-  - https://stock.hostmonit.com/CloudFlareYes（JS动态渲染）
+- 定时抓取优选网站页面的 Cloudflare IP：
 - 自动去重，保证IP唯一
 - 自动推送最新IP列表到仓库
 - 支持只保留指定地区（如中国大陆、香港等）的IP，地区和API可自定义
