@@ -1,39 +1,61 @@
 # -*- coding: utf-8 -*-
+"""
+Cloudflare 优选IP自动抓取脚本
+--------------------------------
+- 支持静态/动态网页抓取，自动去重、排序、地区过滤、排除等功能
+- 配置灵活，支持多数据源、CSS选择器、IP数量限制、地区API等
+- 日志详细，异常处理健壮，兼容多平台
+"""
+
+# ===== 标准库导入 =====
 import os
 import re
 import logging
 import argparse
 import time
-from typing import List, Set, Optional, Dict, Any, Union
+from typing import List, Set, Optional, Dict, Any, Union, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import ipaddress  # 新增: 用于支持CIDR格式网段判断
-
-import requests
-from requests.adapters import HTTPAdapter, Retry
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Page
-import asyncio
-import aiohttp
-import json
+import ipaddress  # 用于支持CIDR格式网段判断
 import threading
 from functools import wraps
+import json
 
-# 新增：读取yaml配置
+# ===== 第三方库导入 =====
+try:
+    import requests
+    from requests.adapters import HTTPAdapter, Retry
+    from bs4 import BeautifulSoup
+    from playwright.sync_api import sync_playwright, Page
+    import asyncio
+    import aiohttp
+except ImportError as e:
+    print(f"缺少依赖: {e}. 请先运行 pip install -r requirements.txt 并安装playwright浏览器。")
+    raise
+
+# ===== 可选依赖（兼容性处理） =====
 try:
     import yaml
 except ImportError:
     yaml = None
     print("未检测到 PyYAML，请先运行 pip install pyyaml")
 
-# ---------------- 配置区 ----------------
+# ===== 常量定义 =====
+USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+DEFAULT_JS_TIMEOUT: int = 30000
+DEFAULT_WAIT_TIMEOUT: int = 5000
+MIN_IP_BLOCK: int = 3
+MAX_THREAD_NUM: int = 4
+
+# ===== 配置区 =====
 # 所有配置均从 config.yaml 读取，缺失项直接报错
+# 详见README.md和config.yaml注释
 
 def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
     """
     读取并校验 config.yaml 配置文件。
     :param config_path: 配置文件路径
     :return: 配置字典
-    :raises: RuntimeError, FileNotFoundError, ValueError, KeyError
+    :raises RuntimeError, FileNotFoundError, ValueError, KeyError: 配置异常
     """
     if not yaml:
         raise RuntimeError('未检测到 PyYAML，请先运行 pip install pyyaml')
@@ -79,7 +101,6 @@ def setup_logging(log_file: str, log_level: str = 'INFO') -> None:
     配置日志输出到文件和控制台。
     :param log_file: 日志文件名
     :param log_level: 日志等级（如INFO、DEBUG等）
-    :return: None
     """
     level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
@@ -99,6 +120,7 @@ def extract_ips(text: str, pattern: str) -> List[str]:
     :param pattern: IP正则表达式
     :return: IP列表 (按找到的顺序)
     """
+    # 使用正则表达式提取所有IP，顺序与原文一致
     return re.findall(pattern, text)
 
 def save_ips(ip_list: List[str], filename: str) -> None:
@@ -106,7 +128,6 @@ def save_ips(ip_list: List[str], filename: str) -> None:
     保存IP列表到文件，保持顺序。
     :param ip_list: IP列表
     :param filename: 输出文件名
-    :return: None
     """
     try:
         with open(filename, 'w', encoding='utf-8') as file:
@@ -132,7 +153,7 @@ def get_retry_session(timeout: int) -> requests.Session:
     return session
 
 # ---------------- 智能抓取 ----------------
-def extract_ips_from_html(html: str, pattern: str, selector: str = None) -> List[str]:
+def extract_ips_from_html(html: str, pattern: str, selector: Optional[str] = None) -> List[str]:
     """
     智能提取IP，优先用selector，其次自动检测IP密集块，最后全局遍历。
     :param html: 网页HTML
@@ -157,7 +178,7 @@ def extract_ips_from_html(html: str, pattern: str, selector: str = None) -> List
         for elem in soup.find_all(tag):
             text = elem.get_text()
             ips = re.findall(pattern, text)
-            if len(ips) >= 3:  # 至少3个IP才认为是候选
+            if len(ips) >= MIN_IP_BLOCK:
                 candidates.append((len(ips), ips))
     if candidates:
         candidates.sort(reverse=True)
@@ -178,13 +199,24 @@ def fetch_ip_auto(
     page: Optional[Page] = None,
     js_retry: int = 3,
     js_retry_interval: float = 2.0,
-    selector: str = None
+    selector: Optional[str] = None
 ) -> List[str]:
+    """
+    智能自动抓取IP，优先静态，失败自动切换JS动态。
+    :param url: 目标URL
+    :param pattern: IP正则
+    :param timeout: 超时时间
+    :param session: requests.Session
+    :param page: Playwright页面对象
+    :param js_retry: JS动态重试次数
+    :param js_retry_interval: JS重试间隔
+    :param selector: CSS选择器
+    :return: IP列表
+    """
     logging.info(f"[AUTO] 正在抓取: {url}")
     extracted_ips: List[str] = []
-    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     try:
-        headers = {"User-Agent": user_agent}
+        headers = {"User-Agent": USER_AGENT}
         response = session.get(url, headers=headers)
         response.raise_for_status()
         text = response.text
@@ -201,7 +233,7 @@ def fetch_ip_auto(
         logging.warning(f"[AUTO] 静态抓取失败: {url}，解析错误: {e}，尝试JS动态")
     if page is not None:
         try:
-            page.set_extra_http_headers({"User-Agent": user_agent})
+            page.set_extra_http_headers({"User-Agent": USER_AGENT})
         except Exception:
             pass
         found_ip_list = []
@@ -209,15 +241,15 @@ def fetch_ip_auto(
             try:
                 text = response.text()
                 ip_list = extract_ips(text, pattern)
-                if len(ip_list) >= 10:  # 阈值可调
+                if len(ip_list) >= MIN_IP_BLOCK:
                     found_ip_list.extend(ip_list)
             except Exception:
                 pass
         page.on("response", handle_response)
         for attempt in range(1, js_retry + 1):
             try:
-                page.goto(url, timeout=30000)
-                page.wait_for_timeout(5000)
+                page.goto(url, timeout=DEFAULT_JS_TIMEOUT)
+                page.wait_for_timeout(DEFAULT_WAIT_TIMEOUT)
                 if found_ip_list:
                     found_ip_list = list(dict.fromkeys(found_ip_list))
                     logging.info(f"[AUTO] 监听接口自动提取到 {len(found_ip_list)} 个IP: {found_ip_list[:10]}")
@@ -255,7 +287,7 @@ def fetch_ip_auto(
         logging.error(f"[AUTO] 未提供page对象，无法进行JS动态抓取: {url}")
     return []
 
-async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession, selector: str = None) -> tuple[str, List[str], bool]:
+async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession, selector: Optional[str] = None) -> tuple[str, List[str], bool]:
     """
     异步静态页面抓取任务，返回(url, IP列表 (有序且唯一), 是否成功)。
     :param url: 目标URL
@@ -342,7 +374,7 @@ async def async_static_crawl(sources: List[Dict[str, str]], pattern: str, timeou
     return url_ips_dict, need_js_urls
 
 # ---------------- 新增：IP排除功能 ----------------
-def build_ip_exclude_checker(exclude_patterns: List[str]) -> callable:
+def build_ip_exclude_checker(exclude_patterns: List[str]) -> Callable[[str], bool]:
     """
     构建IP排除检查器，支持精确匹配和CIDR格式网段匹配。
     :param exclude_patterns: 排除IP/网段列表
@@ -391,7 +423,12 @@ def build_ip_exclude_checker(exclude_patterns: List[str]) -> callable:
     return is_excluded
 
 # 速率限制装饰器（每秒最多N次）
-def rate_limited(max_per_second):
+def rate_limited(max_per_second: int):
+    """
+    速率限制装饰器（每秒最多N次）。
+    :param max_per_second: 每秒最大调用次数
+    :return: 装饰器
+    """
     min_interval = 1.0 / float(max_per_second)
     lock = threading.Lock()
     last_time = [0.0]
@@ -445,7 +482,7 @@ def get_ip_region(ip: str, api_template: str, timeout: int = 5, max_retries: int
     # 多次失败降级，返回空字符串
     return ''
 
-def filter_ips_by_region(ip_list: List[str], allowed_regions: list, api_template: str, timeout: int = 5) -> List[str]:
+def filter_ips_by_region(ip_list: List[str], allowed_regions: List[str], api_template: str, timeout: int = 5) -> List[str]:
     """
     只保留指定地区的IP，保持顺序。
     :param ip_list: 原始IP列表
@@ -466,47 +503,43 @@ def filter_ips_by_region(ip_list: List[str], allowed_regions: list, api_template
             logging.info(f"[REGION] 过滤掉IP: {ip}，归属地: {region if region else '未知'}")
     return filtered
 
-def playwright_dynamic_fetch_worker(args):
+def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
     """
     单个线程任务：独立创建浏览器实例，抓取一个URL的动态IP。
+    :param args: (url, pattern, timeout, js_retry, js_retry_interval, selector)
+    :return: (url, result_ips)
     """
     url, pattern, timeout, js_retry, js_retry_interval, selector = args
     from playwright.sync_api import sync_playwright
-    import re
     session = get_retry_session(timeout)
     result_ips = []
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             try:
-                page.goto(url, timeout=30000)
+                page.goto(url, timeout=DEFAULT_JS_TIMEOUT)
                 ip_list = []
+                selector_success = False
                 if selector:
                     try:
-                        page.wait_for_selector(selector, timeout=10000)
+                        page.wait_for_selector(selector, timeout=20000)
+                        elems = page.query_selector_all(selector)
+                        for elem in elems:
+                            ip_list.extend(re.findall(pattern, elem.inner_text()))
+                        logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
+                        selector_success = len(ip_list) > 0
                     except Exception:
-                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，可能页面结构有变或加载超时")
-                    elems = page.query_selector_all(selector)
-                    for elem in elems:
-                        ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
-                else:
-                    # 遍历table行
+                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，自动降级为全局遍历")
+                if not selector or not selector_success:
+                    # 遍历table、div等常见结构，补充全局遍历
                     for row in page.query_selector_all('table tr'):
                         for cell in row.query_selector_all('td'):
                             ip_list.extend(re.findall(pattern, cell.inner_text()))
                     logging.info(f"[EXTRACT] table遍历提取到{len(ip_list)}个IP")
-                    # pre/code块
-                    for tag in ['pre', 'code']:
-                        for elem in page.query_selector_all(tag):
-                            ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[EXTRACT] pre/code遍历提取到{len(ip_list)}个IP")
-                    # div块
                     for elem in page.query_selector_all('div'):
                         ip_list.extend(re.findall(pattern, elem.inner_text()))
                     logging.info(f"[EXTRACT] div遍历提取到{len(ip_list)}个IP")
-                    # 全局补充
                     all_text = page.content()
                     ip_list.extend(re.findall(pattern, all_text))
                     logging.info(f"[EXTRACT] 全局遍历提取到{len(ip_list)}个IP")
@@ -527,10 +560,9 @@ def main() -> None:
     2. 异步并发静态抓取
     3. Playwright 动态抓取（带重试）
     4. 结果去重并保存
-    :return: None
     """
     config = load_config()
-    sources = config['sources']  # [{url, selector}]
+    sources = config['sources']
     pattern = config['pattern']
     output = config['output']
     timeout = config['timeout']
@@ -554,13 +586,12 @@ def main() -> None:
     need_js_urls: List[Dict[str, str]] = []
     try:
         url_ips_map, need_js_urls_raw = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
-        # need_js_urls_raw为url字符串列表，需转为[{url, selector}]
         need_js_urls = [item for item in sources if item['url'] in need_js_urls_raw]
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
     if need_js_urls:
-        thread_num = min(4, len(need_js_urls))
+        thread_num = min(MAX_THREAD_NUM, len(need_js_urls))
         args_list = [
             (item['url'], pattern, timeout, js_retry, js_retry_interval, item.get('selector'))
             for item in need_js_urls
@@ -569,8 +600,11 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=thread_num) as executor:
             future_to_url = {executor.submit(playwright_dynamic_fetch_worker, args): args[0] for args in args_list}
             for future in as_completed(future_to_url):
-                url, ips = future.result()
-                url_ips_map_dynamic[url] = ips
+                try:
+                    url, ips = future.result()
+                    url_ips_map_dynamic[url] = ips
+                except Exception as e:
+                    logging.error(f"Playwright动态抓取线程异常: {e}")
         for url, ips in url_ips_map_dynamic.items():
             processed_ips_list: List[str]
             if max_ips_per_url > 0 and len(ips) > max_ips_per_url:
@@ -584,7 +618,6 @@ def main() -> None:
     is_excluded_func = build_ip_exclude_checker(exclude_ips_config)
     excluded_count = 0
 
-    # 合并所有URL的IP列表，并应用排除规则，保持顺序
     merged_ips = []
     for url, ips_list_for_url in url_ips_map.items():
         original_count_before_exclude = len(ips_list_for_url)
@@ -596,10 +629,8 @@ def main() -> None:
         logging.info(f"URL {url} 贡献了 {len(retained_ips)} 个IP")
         merged_ips.extend(retained_ips)
 
-    # 全局有序去重
     final_all_ips = list(dict.fromkeys(merged_ips))
 
-    # 地区过滤
     allowed_regions = config.get('allowed_regions', [])
     ip_geo_api = config.get('ip_geo_api', '')
     if allowed_regions and ip_geo_api:
@@ -608,9 +639,9 @@ def main() -> None:
         after_region_count = len(final_all_ips)
         logging.info(f"[REGION] 地区过滤后，IP数量从 {before_region_count} 降至 {after_region_count}")
 
-    # 保存最终IP列表
     save_ips(final_all_ips, output)
     logging.info(f"最终合并了 {len(url_ips_map)} 个URL的IP，排除了 {excluded_count} 个IP，共 {len(final_all_ips)} 个唯一IP")
 
+# ===== 主流程入口 =====
 if __name__ == '__main__':
     main() 
