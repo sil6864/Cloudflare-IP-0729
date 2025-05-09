@@ -490,31 +490,28 @@ def playwright_dynamic_fetch_worker(args):
                     elems = page.query_selector_all(selector)
                     for elem in elems:
                         ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[PLAYWRIGHT] selector提取原始IP数: {len(ip_list)}")
+                    logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
                 else:
                     # 遍历table行
                     for row in page.query_selector_all('table tr'):
                         for cell in row.query_selector_all('td'):
                             ip_list.extend(re.findall(pattern, cell.inner_text()))
-                    logging.info(f"[PLAYWRIGHT] table遍历提取IP数: {len(ip_list)}")
+                    logging.info(f"[EXTRACT] table遍历提取到{len(ip_list)}个IP")
                     # pre/code块
                     for tag in ['pre', 'code']:
                         for elem in page.query_selector_all(tag):
                             ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[PLAYWRIGHT] pre/code遍历后IP数: {len(ip_list)}")
+                    logging.info(f"[EXTRACT] pre/code遍历提取到{len(ip_list)}个IP")
                     # div块
                     for elem in page.query_selector_all('div'):
                         ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[PLAYWRIGHT] div遍历后IP数: {len(ip_list)}")
+                    logging.info(f"[EXTRACT] div遍历提取到{len(ip_list)}个IP")
                     # 全局补充
                     all_text = page.content()
                     ip_list.extend(re.findall(pattern, all_text))
-                    logging.info(f"[PLAYWRIGHT] 全局补充后IP数: {len(ip_list)}")
-                # 正则过滤合法IPv4
-                valid_ips = [ip for ip in ip_list if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip)]
-                # 去重并保持顺序
-                result_ips = list(dict.fromkeys(valid_ips))
-                logging.info(f"[PLAYWRIGHT] 过滤后合法IPv4数: {len(result_ips)}")
+                    logging.info(f"[EXTRACT] 全局遍历提取到{len(ip_list)}个IP")
+                result_ips = ip_list
+                logging.info(f"[DEBUG] {url} 动态抓取前10个IP: {result_ips[:10]}")
             finally:
                 page.close()
                 browser.close()
