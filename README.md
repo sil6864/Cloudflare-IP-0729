@@ -11,6 +11,7 @@
   - https://stock.hostmonit.com/CloudFlareYes（JS动态渲染）
 - 自动去重，保证IP唯一
 - 自动推送最新IP列表到仓库
+- 支持只保留指定地区（如中国大陆、香港等）的IP，地区和API可自定义
 
 ## 项目结构
 - `fetch_cloudflare_ips.py`：主抓取脚本，负责抓取、解析、去重、保存IP
@@ -60,6 +61,10 @@ per_url_limit_mode: "top"  # 超出限制时的筛选模式: random-随机保留
 exclude_ips:           # 排除IP列表，支持单个IP和CIDR格式网段
   - "127.0.0.1"        # 排除单个IP，精确匹配
   - "192.168.1.0/24"   # 排除整个网段，CIDR格式
+allowed_regions:        # 只保留这些地区的IP，使用国家/地区代码（如CN、US、JP等），留空或缺省则不过滤
+  - "CN"
+  - "HK"
+ip_geo_api: "http://ip-api.com/json/{ip}"   # IP归属地API模板，{ip}会被替换为实际IP
 ```
 
 优先级：命令行参数 > 配置文件 > 默认值
@@ -93,6 +98,7 @@ exclude_ips:           # 排除IP列表，支持单个IP和CIDR格式网段
     - 添加 IP 排除功能，支持精确匹配和 CIDR 网段匹配
     - 自动跳过排除列表中的 IP，提升结果质量
     - 优化 `top` 模式的 IP 筛选逻辑，使其真正按照 IP 在源页面上的出现顺序（排名）进行选择，而非简单的字典序排序。
+    - 新增"只保留指定地区IP"功能，支持通过 allowed_regions 和 ip_geo_api 灵活配置地区过滤
 
 ## 其他说明
 - 如需扩展更多 JS 动态页面抓取，可参考 fetch_js_ips 函数实现

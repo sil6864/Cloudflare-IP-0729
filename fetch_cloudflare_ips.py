@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page
 import asyncio
 import aiohttp
+import json
 
 # 新增：读取yaml配置
 try:
@@ -54,7 +55,11 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
                 config['per_url_limit_mode'] = 'random'  # 默认随机保留
             if 'exclude_ips' not in config:
                 config['exclude_ips'] = []  # 默认不排除任何IP
-                
+            # 新增地区过滤相关配置
+            if 'allowed_regions' not in config:
+                config['allowed_regions'] = []  # 默认不限制地区
+            if 'ip_geo_api' not in config:
+                config['ip_geo_api'] = ''  # 默认不查归属地
             return config
     except Exception as e:
         raise RuntimeError(f"读取配置文件失败: {e}")
@@ -385,6 +390,56 @@ def build_ip_exclude_checker(exclude_patterns: List[str]) -> callable:
     
     return is_excluded
 
+# ---------------- 新增：地区过滤相关函数 ----------------
+def get_ip_region(ip: str, api_template: str, timeout: int = 5) -> str:
+    """
+    查询IP归属地，返回国家/地区代码（如CN、US等）。
+    :param ip: IP地址
+    :param api_template: API模板，{ip}会被替换
+    :param timeout: 超时时间
+    :return: 国家/地区代码（大写），失败返回空字符串
+    """
+    if not api_template:
+        return ''
+    url = api_template.replace('{ip}', ip)
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        # 兼容常见API返回格式
+        for key in ['countryCode', 'country_code', 'country', 'countrycode']:
+            if key in data:
+                val = data[key]
+                if isinstance(val, str) and len(val) <= 3:
+                    return val.upper()
+        # ipinfo.io等
+        if 'country' in data and isinstance(data['country'], str):
+            return data['country'].upper()
+    except Exception as e:
+        logging.warning(f"[REGION] 查询IP归属地失败: {ip}, 错误: {e}")
+    return ''
+
+def filter_ips_by_region(ip_set: Set[str], allowed_regions: list, api_template: str, timeout: int = 5) -> Set[str]:
+    """
+    只保留指定地区的IP。
+    :param ip_set: 原始IP集合
+    :param allowed_regions: 允许的地区代码列表
+    :param api_template: 归属地API模板
+    :param timeout: 查询超时时间
+    :return: 过滤后的IP集合
+    """
+    if not allowed_regions or not api_template:
+        return ip_set
+    allowed_set = set([r.upper() for r in allowed_regions if isinstance(r, str)])
+    filtered = set()
+    for ip in ip_set:
+        region = get_ip_region(ip, api_template, timeout)
+        if region in allowed_set:
+            filtered.add(ip)
+        else:
+            logging.info(f"[REGION] 过滤掉IP: {ip}，归属地: {region if region else '未知'}")
+    return filtered
+
 # ---------------- 主流程 ----------------
 def main() -> None:
     """
@@ -476,6 +531,15 @@ def main() -> None:
         
         logging.info(f"URL {url} 贡献了 {len(retained_ips)} 个IP")
         final_all_ips |= retained_ips
+        
+    # 地区过滤
+    allowed_regions = config.get('allowed_regions', [])
+    ip_geo_api = config.get('ip_geo_api', '')
+    if allowed_regions and ip_geo_api:
+        before_region_count = len(final_all_ips)
+        final_all_ips = filter_ips_by_region(final_all_ips, allowed_regions, ip_geo_api)
+        after_region_count = len(final_all_ips)
+        logging.info(f"[REGION] 地区过滤后，IP数量从 {before_region_count} 降至 {after_region_count}")
         
     # 保存最终IP集合
     save_ips(final_all_ips, output)
