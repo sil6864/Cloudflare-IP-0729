@@ -127,37 +127,33 @@ def fetch_ip_auto(
     js_retry: int = 3,
     js_retry_interval: float = 2.0
 ) -> List[str]:
-    """
-    自动判断页面类型并抓取IP，优先静态，失败后用JS动态。
-    返回的IP列表会保持页面上的大致顺序并去重。
-    :param url: 目标URL
-    :param pattern: IP正则
-    :param timeout: 超时时间
-    :param session: requests.Session
-    :param page: Playwright Page对象
-    :param js_retry: JS动态抓取最大重试次数
-    :param js_retry_interval: JS动态抓取重试间隔（秒）
-    :return: IP列表 (有序且唯一)
-    """
     logging.info(f"[AUTO] 正在抓取: {url}")
     extracted_ips: List[str] = []
-    # 先尝试静态抓取
     try:
         response = session.get(url)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        ip_list: List[str] = []
-        table = soup.find('table')
-        if table:
-            for row in table.find_all('tr'):
-                for cell in row.find_all('td'):
-                    ip_list.extend(extract_ips(cell.get_text(), pattern))
+        content_type = response.headers.get('Content-Type', '').lower()
+        text = response.text
+        # 智能判断内容类型
+        if 'text/html' in content_type or '<html' in text.lower():
+            soup = BeautifulSoup(text, 'html.parser')
+            ip_list: List[str] = []
+            table = soup.find('table')
+            if table:
+                for row in table.find_all('tr'):
+                    for cell in row.find_all('td'):
+                        ip_list.extend(extract_ips(cell.get_text(), pattern))
+            else:
+                elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
+                for element in elements:
+                    ip_list.extend(extract_ips(element.get_text(), pattern))
+            extracted_ips = list(dict.fromkeys(ip_list))
+            logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {extracted_ips[:10]}")
         else:
-            elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-            for element in elements:
-                ip_list.extend(extract_ips(element.get_text(), pattern))
-        extracted_ips = list(dict.fromkeys(ip_list)) # 去重并保持顺序
-        logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {extracted_ips[:10]}")
+            # 纯文本或未知类型，直接正则提取
+            ip_list = extract_ips(text, pattern)
+            extracted_ips = list(dict.fromkeys(ip_list))
+            logging.info(f"[DEBUG] {url} 纯文本抓取前10个IP: {extracted_ips[:10]}")
         if extracted_ips:
             logging.info(f"[AUTO] 静态抓取成功: {url}，共{len(extracted_ips)}个IP")
             return extracted_ips
@@ -167,25 +163,31 @@ def fetch_ip_auto(
         logging.warning(f"[AUTO] 静态抓取失败: {url}，网络错误: {e}，尝试JS动态")
     except Exception as e:
         logging.warning(f"[AUTO] 静态抓取失败: {url}，解析错误: {e}，尝试JS动态")
-    # 动态抓取（带重试）
+    # 动态抓取部分同理
     if page is not None:
         for attempt in range(1, js_retry + 1):
             try:
                 page.goto(url, timeout=30000)
                 page.wait_for_timeout(3000)
-                soup = BeautifulSoup(page.content(), 'html.parser')
-                ip_list: List[str] = []
-                table = soup.find('table')
-                if table:
-                    for row in table.find_all('tr'):
-                        for cell in row.find_all('td'):
-                            ip_list.extend(extract_ips(cell.get_text(), pattern))
+                page_content = page.content()
+                if '<html' in page_content.lower():
+                    soup = BeautifulSoup(page_content, 'html.parser')
+                    ip_list: List[str] = []
+                    table = soup.find('table')
+                    if table:
+                        for row in table.find_all('tr'):
+                            for cell in row.find_all('td'):
+                                ip_list.extend(extract_ips(cell.get_text(), pattern))
+                    else:
+                        elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
+                        for element in elements:
+                            ip_list.extend(extract_ips(element.get_text(), pattern))
+                    extracted_ips = list(dict.fromkeys(ip_list))
+                    logging.info(f"[DEBUG] {url} JS动态抓取前10个IP: {extracted_ips[:10]}")
                 else:
-                    elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-                    for element in elements:
-                        ip_list.extend(extract_ips(element.get_text(), pattern))
-                extracted_ips = list(dict.fromkeys(ip_list))
-                logging.info(f"[DEBUG] {url} JS动态抓取前10个IP: {extracted_ips[:10]}")
+                    ip_list = extract_ips(page_content, pattern)
+                    extracted_ips = list(dict.fromkeys(ip_list))
+                    logging.info(f"[DEBUG] {url} JS动态纯文本前10个IP: {extracted_ips[:10]}")
                 if extracted_ips:
                     logging.info(f"[AUTO] JS动态抓取成功: {url}，共{len(extracted_ips)}个IP")
                     return extracted_ips
@@ -198,7 +200,7 @@ def fetch_ip_auto(
         logging.error(f"[AUTO] JS动态抓取多次失败: {url}")
     else:
         logging.error(f"[AUTO] 未提供page对象，无法进行JS动态抓取: {url}")
-    return [] # 返回空列表表示没有找到
+    return []
 
 async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession) -> tuple[str, List[str], bool]:
     """
@@ -215,19 +217,25 @@ async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: a
                 logging.warning(f"[ASYNC] 静态抓取失败: {url}，HTTP状态码: {response.status}")
                 return (url, [], False)
             text = await response.text()
-            soup = BeautifulSoup(text, 'html.parser')
-            ip_list: List[str] = []
-            table = soup.find('table')
-            if table:
-                for row in table.find_all('tr'):
-                    for cell in row.find_all('td'):
-                        ip_list.extend(extract_ips(cell.get_text(), pattern))
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' in content_type or '<html' in text.lower():
+                soup = BeautifulSoup(text, 'html.parser')
+                ip_list: List[str] = []
+                table = soup.find('table')
+                if table:
+                    for row in table.find_all('tr'):
+                        for cell in row.find_all('td'):
+                            ip_list.extend(extract_ips(cell.get_text(), pattern))
+                else:
+                    elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
+                    for element in elements:
+                        ip_list.extend(extract_ips(element.get_text(), pattern))
+                ordered_unique_ips: List[str] = list(dict.fromkeys(ip_list))
+                logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {ordered_unique_ips[:10]}")
             else:
-                elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-                for element in elements:
-                    ip_list.extend(extract_ips(element.get_text(), pattern))
-            ordered_unique_ips: List[str] = list(dict.fromkeys(ip_list))
-            logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {ordered_unique_ips[:10]}")
+                ip_list = extract_ips(text, pattern)
+                ordered_unique_ips: List[str] = list(dict.fromkeys(ip_list))
+                logging.info(f"[DEBUG] {url} 纯文本抓取前10个IP: {ordered_unique_ips[:10]}")
             if ordered_unique_ips:
                 logging.info(f"[ASYNC] 静态抓取成功: {url}，共{len(ordered_unique_ips)}个IP")
                 return (url, ordered_unique_ips, True)
