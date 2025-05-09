@@ -19,6 +19,8 @@ js_retry_interval: 2.0   # JS动态抓取重试间隔（秒）
 max_ips_per_url: 10    # 每个URL最多保留多少个IP（0表示不限制）
 per_url_limit_mode: "top"  # 超出限制时的筛选模式: random-随机保留, top-保留靠前的
 exclude_ips:          # 排除IP列表，支持单个IP和CIDR格式网段
+  - "1.0.0.1"        # 排除单个IP，精确匹配
+  - "1.1.1.1"        # 排除单个IP，精确匹配
   - "127.0.0.1"        # 排除单个IP，精确匹配
   - "192.168.1.0/24"   # 排除整个网段，CIDR格式 
 allowed_regions:        # 只保留这些地区的IP，使用国家/地区代码（如CN、US、HK、JP等），留空或缺省则不过滤
