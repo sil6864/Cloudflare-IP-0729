@@ -41,12 +41,10 @@ except ImportError:
 
 # ===== 常量定义 =====
 USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-DEFAULT_JS_TIMEOUT: int = 60000  # 将默认超时增加到60秒
-DEFAULT_WAIT_TIMEOUT: int = 8000  # 将默认等待时间增加到8秒
-EXTENDED_WAIT_TIMEOUT: int = 15000  # 特定网站的额外等待时间（15秒）
+DEFAULT_JS_TIMEOUT: int = 30000
+DEFAULT_WAIT_TIMEOUT: int = 5000
 MIN_IP_BLOCK: int = 3
 MAX_THREAD_NUM: int = 4
-SPECIAL_DOMAINS = ['stock.hostmonit.com', 'cf.090227.xyz']  # 需要特殊处理的域名
 
 # ===== 配置区 =====
 # 所有配置均从 config.yaml 读取，缺失项直接报错
@@ -76,9 +74,27 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
             new_sources = []
             for item in config['sources']:
                 if isinstance(item, str):
-                    new_sources.append({'url': item, 'selector': None})
+                    new_sources.append({
+                        'url': item, 
+                        'selector': None,
+                        'page_type': None,
+                        'wait_time': DEFAULT_WAIT_TIMEOUT,
+                        'actions': None,
+                        'extra_headers': None,
+                        'response_format': None,
+                        'json_path': None
+                    })
                 elif isinstance(item, dict):
-                    new_sources.append({'url': item['url'], 'selector': item.get('selector')})
+                    new_sources.append({
+                        'url': item['url'], 
+                        'selector': item.get('selector'),
+                        'page_type': item.get('page_type'),
+                        'wait_time': item.get('wait_time', DEFAULT_WAIT_TIMEOUT),
+                        'actions': item.get('actions'),
+                        'extra_headers': item.get('extra_headers'),
+                        'response_format': item.get('response_format'),
+                        'json_path': item.get('json_path')
+                    })
                 else:
                     raise ValueError('sources 列表元素必须为字符串或包含url/selector的字典')
             config['sources'] = new_sources
@@ -93,6 +109,13 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
                 config['allowed_regions'] = []
             if 'ip_geo_api' not in config:
                 config['ip_geo_api'] = ''
+            # 新增配置项默认值
+            if 'auto_detect' not in config:
+                config['auto_detect'] = True
+            if 'xpath_support' not in config:
+                config['xpath_support'] = False
+            if 'follow_redirects' not in config:
+                config['follow_redirects'] = True
             return config
     except Exception as e:
         raise RuntimeError(f"读取配置文件失败: {e}")
@@ -513,8 +536,6 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
     """
     url, pattern, timeout, js_retry, js_retry_interval, selector = args
     from playwright.sync_api import sync_playwright
-    from urllib.parse import urlparse
-    
     session = get_retry_session(timeout)
     result_ips = []
     try:
@@ -522,35 +543,9 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             try:
-                # 检查是否为特殊域名，需要额外等待
-                parsed_url = urlparse(url)
-                domain = parsed_url.netloc
-                is_special_domain = any(special_domain in domain for special_domain in SPECIAL_DOMAINS)
-                
-                # 访问页面
-                logging.info(f"[PLAYWRIGHT] 正在访问: {url} {'(特殊域名，延长等待时间)' if is_special_domain else ''}")
                 page.goto(url, timeout=DEFAULT_JS_TIMEOUT)
-                
-                # 特殊域名需要更长的等待时间
-                if is_special_domain:
-                    logging.info(f"[PLAYWRIGHT] 特殊域名 {domain}，额外等待 {EXTENDED_WAIT_TIMEOUT/1000} 秒")
-                    page.wait_for_timeout(EXTENDED_WAIT_TIMEOUT)
-                else:
-                    page.wait_for_timeout(DEFAULT_WAIT_TIMEOUT)
-                
-                # 尝试等待表格元素加载（特别是对stock.hostmonit.com）
-                if 'stock.hostmonit.com' in domain:
-                    try:
-                        logging.info("[PLAYWRIGHT] 尝试等待表格元素加载...")
-                        page.wait_for_selector('table', timeout=10000)
-                        logging.info("[PLAYWRIGHT] 表格元素已加载")
-                    except Exception as e:
-                        logging.warning(f"[PLAYWRIGHT] 等待表格元素超时: {e}")
-                
                 ip_list = []
                 selector_success = False
-                
-                # 使用选择器提取IP（如果指定了选择器）
                 if selector:
                     try:
                         page.wait_for_selector(selector, timeout=20000)
@@ -559,90 +554,21 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
                             ip_list.extend(re.findall(pattern, elem.inner_text()))
                         logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
                         selector_success = len(ip_list) > 0
-                    except Exception as e:
-                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，自动降级为全局遍历: {e}")
-                
-                # 特殊处理stock.hostmonit.com
-                if 'stock.hostmonit.com' in domain:
-                    try:
-                        # 直接定位IP列
-                        ip_cells = page.query_selector_all('table tr td:nth-child(2)')  # IP通常在第2列
-                        for cell in ip_cells:
-                            cell_text = cell.inner_text()
-                            # 验证是否为有效IP格式
-                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', cell_text):
-                                ip_list.append(cell_text)
-                        logging.info(f"[EXTRACT] 特殊处理stock.hostmonit.com提取到{len(ip_list)}个IP")
-                        if len(ip_list) > 0:
-                            # 如果成功提取了IP，就跳过常规处理
-                            result_ips = list(dict.fromkeys(ip_list))
-                            logging.info(f"[DEBUG] {url} 特殊处理提取到IP: {result_ips[:10]}")
-                            return url, result_ips
-                    except Exception as e:
-                        logging.warning(f"[PLAYWRIGHT] 特殊处理失败: {e}")
-                
-                # 常规处理：遍历table、div等常见结构，补充全局遍历
-                if not selector_success:
-                    # 保存页面HTML用于调试（仅在DEBUG级别日志时）
-                    if logging.getLogger().level <= logging.DEBUG:
-                        html_content = page.content()
-                        debug_file = f"debug_{domain.replace('.', '_')}.html"
-                        with open(debug_file, 'w', encoding='utf-8') as f:
-                            f.write(html_content)
-                        logging.debug(f"[DEBUG] 已保存页面HTML到 {debug_file}")
-                    
-                    # 尝试提取table中的IP
-                    table_ips = []
+                    except Exception:
+                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，自动降级为全局遍历")
+                if not selector or not selector_success:
+                    # 遍历table、div等常见结构，补充全局遍历
                     for row in page.query_selector_all('table tr'):
                         for cell in row.query_selector_all('td'):
-                            table_ips.extend(re.findall(pattern, cell.inner_text()))
-                    logging.info(f"[EXTRACT] table遍历提取到{len(table_ips)}个IP")
-                    
-                    # 检查提取的table IP是否有效（避免1.0.1.1这样的占位符IP）
-                    valid_table_ips = [ip for ip in table_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
-                    if len(valid_table_ips) > 0:
-                        ip_list.extend(valid_table_ips)
-                        logging.info(f"[EXTRACT] table有效IP: {len(valid_table_ips)}个")
-                    else:
-                        ip_list.extend(table_ips)
-                    
-                    # 提取div中的IP
-                    div_ips = []
+                            ip_list.extend(re.findall(pattern, cell.inner_text()))
+                    logging.info(f"[EXTRACT] table遍历提取到{len(ip_list)}个IP")
                     for elem in page.query_selector_all('div'):
-                        div_ips.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[EXTRACT] div遍历提取到{len(div_ips)}个IP")
-                    
-                    # 检查提取的div IP是否有效
-                    valid_div_ips = [ip for ip in div_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
-                    if len(valid_div_ips) > 0:
-                        ip_list.extend(valid_div_ips)
-                        logging.info(f"[EXTRACT] div有效IP: {len(valid_div_ips)}个")
-                    else:
-                        ip_list.extend(div_ips)
-                    
-                    # 全局遍历
+                        ip_list.extend(re.findall(pattern, elem.inner_text()))
+                    logging.info(f"[EXTRACT] div遍历提取到{len(ip_list)}个IP")
                     all_text = page.content()
-                    global_ips = re.findall(pattern, all_text)
-                    logging.info(f"[EXTRACT] 全局遍历提取到{len(global_ips)}个IP")
-                    
-                    # 检查全局IP是否有效
-                    valid_global_ips = [ip for ip in global_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
-                    if len(valid_global_ips) > 0:
-                        ip_list.extend(valid_global_ips)
-                        logging.info(f"[EXTRACT] 全局有效IP: {len(valid_global_ips)}个")
-                    else:
-                        ip_list.extend(global_ips)
-                
-                # 去重并过滤无效IP
-                all_ips = list(dict.fromkeys(ip_list))
-                valid_ips = [ip for ip in all_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
-                
-                if len(valid_ips) > 0:
-                    logging.info(f"[EXTRACT] 过滤掉 {len(all_ips) - len(valid_ips)} 个疑似无效IP")
-                    result_ips = valid_ips
-                else:
-                    result_ips = all_ips
-                
+                    ip_list.extend(re.findall(pattern, all_text))
+                    logging.info(f"[EXTRACT] 全局遍历提取到{len(ip_list)}个IP")
+                result_ips = ip_list
                 logging.info(f"[DEBUG] {url} 动态抓取前10个IP: {result_ips[:10]}")
             finally:
                 page.close()
@@ -650,6 +576,521 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
     except Exception as e:
         logging.error(f"[THREAD] Playwright动态抓取失败: {url}, 错误: {e}")
     return url, result_ips
+
+# ===== 新增：根据页面特性自动检测类型 =====
+def detect_page_type(html_content: str, url: str) -> str:
+    """
+    自动分析页面内容，检测其最可能的类型。
+    :param html_content: 网页内容
+    :param url: 页面URL，用于辅助判断
+    :return: 页面类型 (static/dynamic/api/table)
+    """
+    try:
+        # 检测是否为API返回的JSON
+        if html_content.strip().startswith('{') or html_content.strip().startswith('['):
+            try:
+                json.loads(html_content)
+                logging.info(f"[AUTO-DETECT] {url} 检测为API类型")
+                return 'api'
+            except:
+                pass
+
+        # 判断是否为静态HTML
+        if '<table' in html_content.lower() and '<tr' in html_content.lower() and '<td' in html_content.lower():
+            logging.info(f"[AUTO-DETECT] {url} 检测为表格(table)类型")
+            return 'table'
+        
+        # 判断是否可能需要JS渲染 (检查常见JS框架特征)
+        js_framework_patterns = [
+            'vue', 'react', 'angular', 'axios.get', 'fetch(', 'ajax', 
+            'document.getElementById', 'addEventListener', 
+            '<div id="app"', 'v-for', 'ng-app'
+        ]
+        
+        js_content_triggers = [
+            'setTimeout(', 'setInterval(', '.innerText', '.innerHTML', 
+            'createElement', 'appendChild', 'updateTable', 'loadData'
+        ]
+        
+        lazy_load_patterns = [
+            'lazy-load', 'data-src=', 'loading="lazy"', 'onload=', 
+            'DOMContentLoaded', 'window.onload'
+        ]
+        
+        # 判断页面特征
+        dynamic_score = 0
+        
+        # 检查JS框架特征
+        for pattern in js_framework_patterns:
+            if pattern in html_content.lower():
+                dynamic_score += 2
+        
+        # 检查动态内容特征
+        for trigger in js_content_triggers:
+            if trigger in html_content:
+                dynamic_score += 1
+                
+        # 检查懒加载特征
+        for pattern in lazy_load_patterns:
+            if pattern in html_content.lower():
+                dynamic_score += 1
+                
+        # 如果页面中包含空表格和加载提示，很可能是动态加载
+        if ('<table' in html_content.lower() and 
+            ('<tbody></tbody>' in html_content.lower() or '<tr></tr>' in html_content.lower())):
+            dynamic_score += 3
+            
+        # 检查空壳容器
+        empty_containers = [
+            '<div id="app"></div>', '<div id="root"></div>', 
+            '<div class="container"></div>', '<div class="content"></div>'
+        ]
+        for container in empty_containers:
+            if container in html_content.lower():
+                dynamic_score += 3
+                
+        # 判断逻辑
+        if dynamic_score >= 3:
+            logging.info(f"[AUTO-DETECT] {url} 检测为动态(dynamic)类型 (分数: {dynamic_score})")
+            return 'dynamic'
+        else:
+            logging.info(f"[AUTO-DETECT] {url} 检测为静态(static)类型 (分数: {dynamic_score})")
+            return 'static'
+            
+    except Exception as e:
+        logging.warning(f"[AUTO-DETECT] 自动检测页面类型出错: {url}, 错误: {e}, 使用默认static类型")
+        return 'static'
+
+# ===== 新增：从API响应中提取IP =====
+def extract_ips_from_api(response_text: str, pattern: str, json_path: Optional[str] = None) -> List[str]:
+    """
+    从API响应中提取IP地址。
+    :param response_text: API响应文本
+    :param pattern: IP正则表达式
+    :param json_path: JSON路径，用于提取IP列表，如"data.ips"
+    :return: IP列表（顺序与API返回一致）
+    """
+    try:
+        # 尝试解析为JSON
+        json_data = json.loads(response_text)
+        
+        # 如果指定了JSON路径
+        if json_path:
+            # 按路径逐层获取
+            parts = json_path.split('.')
+            data = json_data
+            for part in parts:
+                if isinstance(data, dict) and part in data:
+                    data = data[part]
+                else:
+                    logging.warning(f"[API] JSON路径 {json_path} 中的 {part} 未找到")
+                    return []
+            
+            # 提取IP列表
+            if isinstance(data, list):
+                # 如果直接是IP列表
+                ip_list = []
+                for item in data:
+                    if isinstance(item, str) and re.match(pattern, item):
+                        ip_list.append(item)
+                    elif isinstance(item, dict) and 'ip' in item:
+                        ip = item['ip']
+                        if isinstance(ip, str) and re.match(pattern, ip):
+                            ip_list.append(ip)
+                if ip_list:
+                    logging.info(f"[API] 从JSON路径 {json_path} 提取到 {len(ip_list)} 个IP")
+                    return ip_list
+            
+            # 如果是字符串，可能是逗号分隔的IP列表
+            elif isinstance(data, str):
+                ip_list = re.findall(pattern, data)
+                if ip_list:
+                    logging.info(f"[API] 从JSON路径 {json_path} 提取到 {len(ip_list)} 个IP")
+                    return ip_list
+        
+        # 如果没有指定JSON路径或者指定路径提取失败，尝试智能提取
+        # 1. 尝试在整个JSON字符串中直接提取IP
+        ip_list = re.findall(pattern, response_text)
+        if ip_list:
+            logging.info(f"[API] 从整个JSON响应中提取到 {len(ip_list)} 个IP")
+            return ip_list
+        
+        # 2. 尝试搜索常见的IP字段名
+        common_ip_fields = ['ip', 'address', 'ipAddress', 'hostIP', 'serverIP', 'endpoint']
+        for field in common_ip_fields:
+            ips = []
+            # 递归搜索json数据中的IP字段
+            def search_ip_field(data, field_name):
+                nonlocal ips
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if key == field_name and isinstance(value, str) and re.match(pattern, value):
+                            ips.append(value)
+                        elif isinstance(value, (dict, list)):
+                            search_ip_field(value, field_name)
+                elif isinstance(data, list):
+                    for item in data:
+                        search_ip_field(item, field_name)
+            
+            search_ip_field(json_data, field)
+            if ips:
+                logging.info(f"[API] 搜索字段 '{field}' 提取到 {len(ips)} 个IP")
+                return ips
+        
+        logging.warning("[API] 未能从API响应中提取到IP")
+        return []
+    except json.JSONDecodeError:
+        # 如果不是有效JSON，尝试直接用正则提取IP
+        logging.warning("[API] API响应解析JSON失败，尝试直接正则提取IP")
+        ip_list = re.findall(pattern, response_text)
+        if ip_list:
+            logging.info(f"[API] 从非JSON响应中提取到 {len(ip_list)} 个IP")
+            return ip_list
+        return []
+    except Exception as e:
+        logging.error(f"[API] 提取IP异常: {e}")
+        return []
+
+# ===== 新增：从表格中提取IP =====
+def extract_ips_from_table(html: str, pattern: str, selector: Optional[str] = None) -> List[str]:
+    """
+    专门从表格结构中提取IP，处理各种表格格式。
+    :param html: 网页HTML
+    :param pattern: IP正则
+    :param selector: 可选，CSS选择器
+    :return: IP列表（顺序与页面一致）
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    ip_list = []
+    
+    # 1. 优先用selector
+    if selector:
+        elements = soup.select(selector)
+        if elements:
+            for elem in elements:
+                tables = elem.find_all('table')
+                if tables:
+                    # 处理选择器内的表格
+                    for table in tables:
+                        process_table(table, ip_list, pattern)
+                else:
+                    # 如果选择器没有找到表格，但可能选择器本身就是表格或表格行
+                    if elem.name == 'table':
+                        process_table(elem, ip_list, pattern)
+                    elif elem.name == 'tr':
+                        process_table_row(elem, ip_list, pattern)
+                    else:
+                        # 直接从元素文本中提取
+                        ips = re.findall(pattern, elem.get_text())
+                        ip_list.extend(ips)
+            
+            if ip_list:
+                logging.info(f"[TABLE] 使用selector '{selector}' 提取表格中的IP，共{len(ip_list)}个")
+                return list(dict.fromkeys(ip_list))
+    
+    # 2. 自动提取所有表格
+    tables = soup.find_all('table')
+    table_results = []
+    for table in tables:
+        table_ips = []
+        process_table(table, table_ips, pattern)
+        if table_ips:
+            table_results.append((len(table_ips), table_ips))
+    
+    # 按表格中IP数量排序
+    if table_results:
+        table_results.sort(reverse=True)
+        ip_list = table_results[0][1]  # 取IP最多的表格
+        logging.info(f"[TABLE] 自动提取到表格中的IP，共{len(ip_list)}个")
+        return list(dict.fromkeys(ip_list))
+    
+    # 3. 找不到表格或表格中没有IP，尝试从列表中提取
+    list_elements = soup.find_all('ul')
+    for ul in list_elements:
+        for li in ul.find_all('li'):
+            ip_list.extend(re.findall(pattern, li.get_text()))
+    
+    if ip_list:
+        logging.info(f"[TABLE] 从列表中提取到IP，共{len(ip_list)}个")
+        return list(dict.fromkeys(ip_list))
+    
+    # 4. 最后尝试全局提取
+    ip_list = re.findall(pattern, html)
+    logging.info(f"[TABLE] 全局提取到IP，共{len(ip_list)}个")
+    return list(dict.fromkeys(ip_list))
+
+def process_table(table, ip_list, pattern):
+    """
+    处理单个表格，提取IP。
+    :param table: BeautifulSoup表格元素
+    :param ip_list: 保存IP的列表
+    :param pattern: IP正则
+    """
+    # 处理表头行
+    thead = table.find('thead')
+    if thead:
+        for row in thead.find_all('tr'):
+            process_table_row(row, ip_list, pattern)
+    
+    # 处理表格主体
+    tbody = table.find('tbody')
+    if tbody:
+        for row in tbody.find_all('tr'):
+            process_table_row(row, ip_list, pattern)
+    else:
+        # 没有tbody直接处理所有行
+        for row in table.find_all('tr'):
+            process_table_row(row, ip_list, pattern)
+
+def process_table_row(row, ip_list, pattern):
+    """
+    处理表格的一行，提取IP。
+    :param row: BeautifulSoup表格行元素
+    :param ip_list: 保存IP的列表
+    :param pattern: IP正则
+    """
+    # 优先查找带有特定类名的单元格（如推荐、优选等关键词）
+    priority_cells = row.select('td.recommended, td.preferred, td.best, td.optimal, td.fast')
+    if priority_cells:
+        for cell in priority_cells:
+            ip_list.extend(re.findall(pattern, cell.get_text()))
+        if ip_list:  # 如果已找到IP则返回
+            return
+    
+    # 处理所有单元格
+    for cell in row.find_all(['td', 'th']):
+        ip_list.extend(re.findall(pattern, cell.get_text()))
+
+# ===== 新增：增强的动态页面处理 =====
+def perform_page_actions(page: Page, actions: List[Dict[str, Any]]) -> None:
+    """
+    执行页面交互操作序列。
+    :param page: Playwright Page对象
+    :param actions: 操作列表
+    """
+    if not actions:
+        return
+    
+    logging.info(f"[ACTIONS] 开始执行 {len(actions)} 个页面交互操作")
+    
+    for i, action in enumerate(actions):
+        try:
+            action_type = action.get('type', '').lower()
+            
+            if action_type == 'click':
+                selector = action.get('selector')
+                if not selector:
+                    logging.warning(f"[ACTIONS] 操作 {i+1}: 点击操作缺少selector，跳过")
+                    continue
+                
+                logging.info(f"[ACTIONS] 操作 {i+1}: 点击元素 '{selector}'")
+                # 等待元素可点击
+                page.wait_for_selector(selector, state='visible', timeout=10000)
+                page.click(selector)
+                
+            elif action_type == 'wait':
+                time_ms = action.get('time', 1000)  # 默认等待1秒
+                logging.info(f"[ACTIONS] 操作 {i+1}: 等待 {time_ms}ms")
+                page.wait_for_timeout(time_ms)
+                
+            elif action_type == 'input':
+                selector = action.get('selector')
+                value = action.get('value', '')
+                if not selector:
+                    logging.warning(f"[ACTIONS] 操作 {i+1}: 输入操作缺少selector，跳过")
+                    continue
+                
+                logging.info(f"[ACTIONS] 操作 {i+1}: 向 '{selector}' 输入文本")
+                page.fill(selector, value)
+                
+            elif action_type == 'select':
+                selector = action.get('selector')
+                value = action.get('value')
+                if not selector or value is None:
+                    logging.warning(f"[ACTIONS] 操作 {i+1}: 选择操作缺少selector或value，跳过")
+                    continue
+                
+                logging.info(f"[ACTIONS] 操作 {i+1}: 在 '{selector}' 中选择 '{value}'")
+                page.select_option(selector, value)
+                
+            elif action_type == 'scroll':
+                selector = action.get('selector')
+                if selector:
+                    logging.info(f"[ACTIONS] 操作 {i+1}: 滚动到元素 '{selector}'")
+                    page.scroll_into_view_if_needed(selector)
+                else:
+                    x = action.get('x', 0)
+                    y = action.get('y', 0)
+                    logging.info(f"[ACTIONS] 操作 {i+1}: 滚动到位置 ({x}, {y})")
+                    page.evaluate(f"window.scrollTo({x}, {y})")
+                    
+            elif action_type == 'wait_for_selector':
+                selector = action.get('selector')
+                timeout = action.get('timeout', 30000)
+                if not selector:
+                    logging.warning(f"[ACTIONS] 操作 {i+1}: 等待元素操作缺少selector，跳过")
+                    continue
+                
+                logging.info(f"[ACTIONS] 操作 {i+1}: 等待元素 '{selector}' 出现")
+                page.wait_for_selector(selector, timeout=timeout)
+                
+            elif action_type == 'wait_for_load':
+                state = action.get('state', 'load')  # load, domcontentloaded, networkidle
+                timeout = action.get('timeout', 30000)
+                logging.info(f"[ACTIONS] 操作 {i+1}: 等待页面 {state} 状态")
+                page.wait_for_load_state(state, timeout=timeout)
+                
+            elif action_type == 'evaluate':
+                script = action.get('script', '')
+                if not script:
+                    logging.warning(f"[ACTIONS] 操作 {i+1}: 执行脚本操作缺少script，跳过")
+                    continue
+                
+                logging.info(f"[ACTIONS] 操作 {i+1}: 执行脚本")
+                page.evaluate(script)
+                
+            else:
+                logging.warning(f"[ACTIONS] 操作 {i+1}: 未知操作类型 '{action_type}'，跳过")
+                
+            # 每个操作后短暂等待，避免页面响应不及时
+            page.wait_for_timeout(500)
+            
+        except Exception as e:
+            logging.error(f"[ACTIONS] 操作 {i+1} 执行失败: {e}")
+    
+    logging.info("[ACTIONS] 页面交互操作执行完成")
+
+def fetch_ip_enhanced(
+    source: Dict[str, Any],
+    pattern: str,
+    timeout: int,
+    session: requests.Session,
+    page: Optional[Page] = None,
+    js_retry: int = 3,
+    js_retry_interval: float = 2.0,
+    auto_detect: bool = True
+) -> List[str]:
+    """
+    增强版IP抓取，根据页面类型自动选择最优抓取策略。
+    :param source: 数据源配置
+    :param pattern: IP正则
+    :param timeout: 超时时间
+    :param session: requests.Session
+    :param page: Playwright页面对象
+    :param js_retry: JS动态重试次数
+    :param js_retry_interval: JS重试间隔
+    :param auto_detect: 是否自动检测页面类型
+    :return: IP列表
+    """
+    url = source['url']
+    selector = source.get('selector')
+    page_type = source.get('page_type')
+    wait_time = source.get('wait_time', DEFAULT_WAIT_TIMEOUT)
+    actions = source.get('actions')
+    extra_headers = source.get('extra_headers', {})
+    response_format = source.get('response_format')
+    json_path = source.get('json_path')
+    
+    logging.info(f"[ENHANCED] 开始抓取: {url}")
+    extracted_ips: List[str] = []
+    
+    # 合并自定义请求头
+    headers = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        headers.update(extra_headers)
+    
+    # 第一步：尝试静态请求获取响应内容
+    try:
+        response = session.get(url, headers=headers)
+        response.raise_for_status()
+        content = response.text
+        
+        # 如果未指定页面类型且开启自动检测，进行检测
+        detected_type = None
+        if auto_detect and not page_type:
+            detected_type = detect_page_type(content, url)
+            page_type = detected_type
+        
+        logging.info(f"[ENHANCED] {url} 页面类型: {page_type or '未指定'}")
+        
+        # 根据页面类型使用不同提取策略
+        if page_type == 'api':
+            # API类型，直接解析JSON
+            extracted_ips = extract_ips_from_api(content, pattern, json_path)
+            if extracted_ips:
+                logging.info(f"[ENHANCED] API响应解析成功: {url}，共{len(extracted_ips)}个IP")
+                return extracted_ips
+            else:
+                logging.warning(f"[ENHANCED] API响应解析无IP: {url}，尝试动态抓取")
+        
+        elif page_type == 'table':
+            # 表格类型，使用专用表格提取器
+            extracted_ips = extract_ips_from_table(content, pattern, selector)
+            if extracted_ips:
+                logging.info(f"[ENHANCED] 表格解析成功: {url}，共{len(extracted_ips)}个IP")
+                return extracted_ips
+            else:
+                logging.warning(f"[ENHANCED] 表格解析无IP: {url}，尝试动态抓取")
+        
+        elif page_type == 'static' or not page_type:
+            # 静态页面，使用通用提取器
+            extracted_ips = extract_ips_from_html(content, pattern, selector)
+            if extracted_ips:
+                logging.info(f"[ENHANCED] 静态解析成功: {url}，共{len(extracted_ips)}个IP")
+                return extracted_ips
+            else:
+                logging.warning(f"[ENHANCED] 静态解析无IP: {url}，尝试动态抓取")
+    
+    except requests.RequestException as e:
+        logging.warning(f"[ENHANCED] 静态请求失败: {url}，错误: {e}，尝试动态抓取")
+    except Exception as e:
+        logging.warning(f"[ENHANCED] 解析异常: {url}，错误: {e}，尝试动态抓取")
+    
+    # 如果静态抓取失败或指定了动态页面类型，尝试动态抓取
+    if page and (page_type == 'dynamic' or not extracted_ips):
+        try:
+            page.set_extra_http_headers(headers)
+            for attempt in range(1, js_retry + 1):
+                try:
+                    logging.info(f"[ENHANCED] 动态抓取: {url}，第{attempt}次尝试")
+                    page.goto(url, timeout=DEFAULT_JS_TIMEOUT)
+                    
+                    # 执行页面交互操作
+                    if actions:
+                        perform_page_actions(page, actions)
+                    else:
+                        # 默认等待页面加载完成
+                        page.wait_for_load_state('networkidle', timeout=wait_time)
+                        page.wait_for_timeout(1000)  # 额外等待1秒
+                    
+                    # 获取页面内容并提取IP
+                    page_content = page.content()
+                    
+                    # 根据页面类型使用不同提取策略
+                    if page_type == 'table':
+                        extracted_ips = extract_ips_from_table(page_content, pattern, selector)
+                    else:
+                        extracted_ips = extract_ips_from_html(page_content, pattern, selector)
+                    
+                    if extracted_ips:
+                        logging.info(f"[ENHANCED] 动态抓取成功: {url}，共{len(extracted_ips)}个IP")
+                        return extracted_ips
+                    else:
+                        logging.warning(f"[ENHANCED] 动态抓取无IP: {url}，第{attempt}次")
+                        
+                except Exception as e:
+                    logging.error(f"[ENHANCED] 动态抓取异常: {url}，第{attempt}次，错误: {e}")
+                
+                if attempt < js_retry:
+                    time.sleep(js_retry_interval)
+            
+            logging.error(f"[ENHANCED] 动态抓取多次失败: {url}")
+        except Exception as e:
+            logging.error(f"[ENHANCED] 动态抓取初始化失败: {url}，错误: {e}")
+    elif page_type == 'dynamic' and not page:
+        logging.error(f"[ENHANCED] 需要动态抓取但未提供page对象: {url}")
+    
+    return extracted_ips
 
 # ---------------- 主流程 ----------------
 def main() -> None:
@@ -673,8 +1114,13 @@ def main() -> None:
     max_ips_per_url = config['max_ips_per_url']
     per_url_limit_mode = config['per_url_limit_mode']
     exclude_ips_config = config['exclude_ips']
+    auto_detect = config.get('auto_detect', True)
+    xpath_support = config.get('xpath_support', False)
+    follow_redirects = config.get('follow_redirects', True)
 
     setup_logging(log_file, log_level)
+    logging.info(f"开始执行Cloudflare IP抓取，自动检测: {auto_detect}, XPath支持: {xpath_support}")
+    
     if os.path.exists(output):
         try:
             os.remove(output)
@@ -682,38 +1128,97 @@ def main() -> None:
             logging.error(f"无法删除旧的输出文件: {output}，错误: {e}")
 
     url_ips_map: Dict[str, List[str]] = {}
-    need_js_urls: List[Dict[str, str]] = []
-    try:
-        url_ips_map, need_js_urls_raw = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
-        need_js_urls = [item for item in sources if item['url'] in need_js_urls_raw]
-    except Exception as e:
-        logging.error(f"异步静态抓取流程异常: {e}")
-
-    if need_js_urls:
-        thread_num = min(MAX_THREAD_NUM, len(need_js_urls))
-        args_list = [
-            (item['url'], pattern, timeout, js_retry, js_retry_interval, item.get('selector'))
-            for item in need_js_urls
-        ]
-        url_ips_map_dynamic = {}
-        with ThreadPoolExecutor(max_workers=thread_num) as executor:
-            future_to_url = {executor.submit(playwright_dynamic_fetch_worker, args): args[0] for args in args_list}
-            for future in as_completed(future_to_url):
-                try:
-                    url, ips = future.result()
-                    url_ips_map_dynamic[url] = ips
-                except Exception as e:
-                    logging.error(f"Playwright动态抓取线程异常: {e}")
-        for url, ips in url_ips_map_dynamic.items():
-            processed_ips_list: List[str]
-            if max_ips_per_url > 0 and len(ips) > max_ips_per_url:
-                original_count = len(ips)
-                processed_ips_list = limit_ips(ips, max_ips_per_url, per_url_limit_mode)
-                logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_list)}")
+    static_sources = []
+    dynamic_sources = []
+    
+    # 根据页面类型分类数据源
+    for source in sources:
+        url = source['url']
+        page_type = source.get('page_type')
+        # 如果明确指定为dynamic或配置了actions，直接归为动态
+        if page_type == 'dynamic' or source.get('actions'):
+            dynamic_sources.append(source)
+            logging.info(f"URL {url} 已归类为动态抓取")
+        else:
+            # 其他类型先尝试静态抓取
+            static_sources.append(source)
+            logging.info(f"URL {url} 已归类为静态抓取（可能降级为动态）")
+    
+    # 创建全局session（支持重定向）
+    session = get_retry_session(timeout)
+    if follow_redirects:
+        session.max_redirects = 5
+    
+    # 处理静态抓取
+    for source in static_sources:
+        try:
+            extracted_ips = fetch_ip_enhanced(
+                source=source,
+                pattern=pattern,
+                timeout=timeout,
+                session=session,
+                page=None,  # 静态模式不需要page
+                auto_detect=auto_detect
+            )
+            
+            if max_ips_per_url > 0 and len(extracted_ips) > max_ips_per_url:
+                original_count = len(extracted_ips)
+                processed_ips = limit_ips(extracted_ips, max_ips_per_url, per_url_limit_mode)
+                logging.info(f"[LIMIT] URL {source['url']} IP数量从 {original_count} 限制为 {len(processed_ips)}")
+                url_ips_map[source['url']] = processed_ips
             else:
-                processed_ips_list = ips
-            url_ips_map[url] = processed_ips_list
+                url_ips_map[source['url']] = extracted_ips
+            
+            if not extracted_ips:
+                # 静态抓取失败，加入动态队列
+                dynamic_sources.append(source)
+                logging.info(f"URL {source['url']} 静态抓取失败，已加入动态队列")
+                
+        except Exception as e:
+            logging.error(f"处理静态源异常: {source['url']}, 错误: {e}")
+            # 出错也加入动态队列
+            dynamic_sources.append(source)
+    
+    # 处理动态抓取
+    if dynamic_sources:
+        # 使用Playwright处理动态页面
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context()
+                page = context.new_page()
+                
+                for source in dynamic_sources:
+                    try:
+                        extracted_ips = fetch_ip_enhanced(
+                            source=source,
+                            pattern=pattern,
+                            timeout=timeout,
+                            session=session,
+                            page=page,
+                            js_retry=js_retry,
+                            js_retry_interval=js_retry_interval,
+                            auto_detect=auto_detect
+                        )
+                        
+                        if max_ips_per_url > 0 and len(extracted_ips) > max_ips_per_url:
+                            original_count = len(extracted_ips)
+                            processed_ips = limit_ips(extracted_ips, max_ips_per_url, per_url_limit_mode)
+                            logging.info(f"[LIMIT] URL {source['url']} IP数量从 {original_count} 限制为 {len(processed_ips)}")
+                            url_ips_map[source['url']] = processed_ips
+                        else:
+                            url_ips_map[source['url']] = extracted_ips
+                            
+                    except Exception as e:
+                        logging.error(f"处理动态源异常: {source['url']}, 错误: {e}")
+                
+                page.close()
+                context.close()
+                browser.close()
+        except Exception as e:
+            logging.error(f"Playwright初始化失败: {e}")
 
+    # 排除IP和地区过滤
     is_excluded_func = build_ip_exclude_checker(exclude_ips_config)
     excluded_count = 0
 
