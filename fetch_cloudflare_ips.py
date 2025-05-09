@@ -15,6 +15,8 @@ from playwright.sync_api import sync_playwright, Page
 import asyncio
 import aiohttp
 import json
+from functools import lru_cache
+import threading
 
 # 新增：读取yaml配置
 try:
@@ -391,32 +393,52 @@ def build_ip_exclude_checker(exclude_patterns: List[str]) -> callable:
     return is_excluded
 
 # ---------------- 新增：地区过滤相关函数 ----------------
-def get_ip_region(ip: str, api_template: str, timeout: int = 5) -> str:
+# 限流相关全局变量
+_api_last_call = 0.0
+_api_lock = threading.Lock()
+_API_RATE_LIMIT = 5  # 每秒最多5次
+
+@lru_cache(maxsize=1000)
+def get_ip_region(ip: str, api_template: str, timeout: int = 5, max_retries: int = 3, retry_interval: float = 1.0) -> str:
     """
-    查询IP归属地，返回国家/地区代码（如CN、US等）。
+    查询IP归属地，返回国家/地区代码（如CN、US等），增加重试、降级、内存缓存和速率限制。
     :param ip: IP地址
     :param api_template: API模板，{ip}会被替换
     :param timeout: 超时时间
+    :param max_retries: 最大重试次数
+    :param retry_interval: 重试间隔（秒）
     :return: 国家/地区代码（大写），失败返回空字符串
     """
     if not api_template:
         return ''
     url = api_template.replace('{ip}', ip)
-    try:
-        resp = requests.get(url, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        # 兼容常见API返回格式
-        for key in ['countryCode', 'country_code', 'country', 'countrycode']:
-            if key in data:
-                val = data[key]
-                if isinstance(val, str) and len(val) <= 3:
-                    return val.upper()
-        # ipinfo.io等
-        if 'country' in data and isinstance(data['country'], str):
-            return data['country'].upper()
-    except Exception as e:
-        logging.warning(f"[REGION] 查询IP归属地失败: {ip}, 错误: {e}")
+    global _api_last_call
+    for attempt in range(1, max_retries + 1):
+        # 限流控制
+        with _api_lock:
+            now = time.monotonic()
+            wait = max(0, (1/_API_RATE_LIMIT) - (now - _api_last_call))
+            if wait > 0:
+                time.sleep(wait)
+            _api_last_call = time.monotonic()
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            # 兼容常见API返回格式
+            for key in ['countryCode', 'country_code', 'country', 'countrycode']:
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, str) and len(val) <= 3:
+                        return val.upper()
+            # ipinfo.io等
+            if 'country' in data and isinstance(data['country'], str):
+                return data['country'].upper()
+        except Exception as e:
+            logging.warning(f"[REGION] 查询IP归属地失败: {ip}, 第{attempt}次, 错误: {e}")
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+    # 多次失败降级，返回空字符串
     return ''
 
 def filter_ips_by_region(ip_set: Set[str], allowed_regions: list, api_template: str, timeout: int = 5) -> Set[str]:
@@ -433,7 +455,7 @@ def filter_ips_by_region(ip_set: Set[str], allowed_regions: list, api_template: 
     allowed_set = set([r.upper() for r in allowed_regions if isinstance(r, str)])
     filtered = set()
     for ip in ip_set:
-        region = get_ip_region(ip, api_template, timeout)
+        region = get_ip_region(ip, api_template, timeout, max_retries=3, retry_interval=1.0)
         if region in allowed_set:
             filtered.add(ip)
         else:
@@ -441,6 +463,23 @@ def filter_ips_by_region(ip_set: Set[str], allowed_regions: list, api_template: 
     return filtered
 
 # ---------------- 主流程 ----------------
+def playwright_fetch_ip_worker(url, pattern, timeout, js_retry, js_retry_interval):
+    from playwright.sync_api import sync_playwright
+    session = get_retry_session(timeout)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                return url, set(fetched_ip_list_dynamic)
+            finally:
+                page.close()
+                browser.close()
+    except Exception as e:
+        logging.error(f"[THREAD] Playwright 抓取失败: {url}, 错误: {e}")
+        return url, set()
+
 def main() -> None:
     """
     主程序入口，只从 config.yaml 读取配置，缺失项报错。
@@ -481,37 +520,23 @@ def main() -> None:
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
-    # 统一用一个浏览器实例处理所有需要JS动态的url
+    # 统一用线程池并发处理所有需要JS动态的url
     if need_js_urls:
-        session = get_retry_session(timeout)
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                try:
-                    for url in need_js_urls:
-                        # fetch_ip_auto 返回 List[str]
-                        fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
-                        processed_ips_set_dynamic: Set[str]
-                        # 应用IP数量限制
-                        if max_ips_per_url > 0 and len(fetched_ip_list_dynamic) > max_ips_per_url:
-                            original_count = len(fetched_ip_list_dynamic)
-                            if per_url_limit_mode == 'top':
-                                # top模式直接使用有序列表
-                                processed_ips_set_dynamic = limit_ips(fetched_ip_list_dynamic, max_ips_per_url, per_url_limit_mode)
-                            else:
-                                # random或其他模式，先转为set再处理
-                                processed_ips_set_dynamic = limit_ips(set(fetched_ip_list_dynamic), max_ips_per_url, per_url_limit_mode)
-                            logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_set_dynamic)}")
-                        else:
-                            processed_ips_set_dynamic = set(fetched_ip_list_dynamic)
-                        url_ips_map[url] = processed_ips_set_dynamic # 添加或更新动态抓取的IP
-                finally:
-                    page.close()
-                    browser.close()
-        except Exception as e:
-            logging.error(f"Playwright 启动或抓取失败: {e}")
-            
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        thread_max_workers = 4
+        results = []
+        with ThreadPoolExecutor(max_workers=thread_max_workers) as executor:
+            future_to_url = {
+                executor.submit(playwright_fetch_ip_worker, url, pattern, timeout, js_retry, js_retry_interval): url
+                for url in need_js_urls
+            }
+            for future in as_completed(future_to_url):
+                url, ip_set = future.result()
+                if ip_set:
+                    url_ips_map[url] = ip_set
+                else:
+                    logging.warning(f"[THREAD] Playwright未获取到IP: {url}")
+
     # 构建IP排除检查器
     is_excluded_func = build_ip_exclude_checker(exclude_ips_config) # 使用重命名的配置变量
     excluded_count = 0
