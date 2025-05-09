@@ -94,18 +94,18 @@ def extract_ips(text: str, pattern: str) -> List[str]:
     """
     return re.findall(pattern, text)
 
-def save_ips(ip_set: Set[str], filename: str) -> None:
+def save_ips(ip_list: List[str], filename: str) -> None:
     """
-    保存IP集合到文件。
-    :param ip_set: IP集合
+    保存IP列表到文件，保持顺序。
+    :param ip_list: IP列表
     :param filename: 输出文件名
     :return: None
     """
     try:
         with open(filename, 'w', encoding='utf-8') as file:
-            for ip in sorted(ip_set):
+            for ip in ip_list:
                 file.write(ip + '\n')
-        logging.info(f"共保存 {len(ip_set)} 个唯一IP到 {filename}")
+        logging.info(f"共保存 {len(ip_list)} 个唯一IP到 {filename}")
     except Exception as e:
         logging.error(f"写入文件失败: {filename}，错误: {e}")
 
@@ -276,48 +276,39 @@ async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: a
         return (url, [], False)
 
 # ---------------- 新增：IP数量限制 ----------------
-def limit_ips(ip_collection: Union[List[str], Set[str]], max_count: int, mode: str = 'random') -> Set[str]:
+def limit_ips(ip_collection: Union[List[str], Set[str]], max_count: int, mode: str = 'random') -> List[str]:
     """
-    限制IP集合/列表的数量，根据指定模式返回有限的IP集合。
+    限制IP集合/列表的数量，根据指定模式返回有限的IP列表（有序）。
     :param ip_collection: 原始IP列表 (用于top模式，需保持顺序) 或集合 (用于random模式)
     :param max_count: 最大保留数量，0表示不限制
     :param mode: 限制模式，'random'为随机保留，'top'为保留页面靠前的
-    :return: 限制后的IP集合
+    :return: 限制后的IP列表（有序）
     """
-    collection_len = len(ip_collection)
-    
+    collection_list = list(ip_collection)
+    collection_len = len(collection_list)
     if max_count <= 0 or collection_len <= max_count:
-        # 如果不限制或数量已在限制内，确保返回的是Set类型
-        if isinstance(ip_collection, list):
-            return set(ip_collection)
-        return ip_collection # 已经是Set
-
+        return collection_list
     if mode == 'top':
-        if isinstance(ip_collection, list):
-            # 如果是列表（期望的输入），按原始顺序取top N
-            return set(ip_collection[:max_count])
-        else:
-            # 如果错误地传入了set，则退回按字典序排序（旧行为）
-            logging.warning("[LIMIT] Top mode 收到 Set 类型输入，将按字典序排序选取。")
-            return set(sorted(list(ip_collection))[:max_count])
+        return collection_list[:max_count]
     elif mode == 'random':
-        # 随机模式，确保输入是列表以便采样
-        return set(random.sample(list(ip_collection), max_count))
+        import random
+        return random.sample(collection_list, max_count)
     else:
         logging.warning(f"[LIMIT] 未知的限制模式: {mode}，使用默认的随机模式")
-        return set(random.sample(list(ip_collection), max_count))
+        import random
+        return random.sample(collection_list, max_count)
 
-async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, Set[str]], List[str]]:
+async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, List[str]], List[str]]:
     """
-    并发抓取所有静态页面，返回每个URL的IP集合和需要JS动态抓取的URL。
+    并发抓取所有静态页面，返回每个URL的IP列表和需要JS动态抓取的URL。
     :param sources: URL列表
     :param pattern: IP正则
     :param timeout: 超时时间
     :param max_ips: 每个URL最多保留的IP数量，0表示不限制
     :param limit_mode: 限制模式，'random'为随机保留，'top'为保留页面靠前的
-    :return: (每个URL的IP集合字典, 需要JS动态抓取的URL列表)
+    :return: (每个URL的IP列表字典, 需要JS动态抓取的URL列表)
     """
-    url_ips_dict: Dict[str, Set[str]] = {} # 修改变量名以避免与外部的url_ips混淆
+    url_ips_dict: Dict[str, List[str]] = {}
     need_js_urls: List[str] = []
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -325,20 +316,14 @@ async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max
         results = await asyncio.gather(*tasks)
         for url, fetched_ip_list, success in results: # fetched_ip_list 是 List[str]
             if success:
-                processed_ips_set: Set[str]
+                processed_ips_list: List[str]
                 if max_ips > 0 and len(fetched_ip_list) > max_ips:
                     original_count = len(fetched_ip_list)
-                    if limit_mode == 'top':
-                        # top模式直接使用有序列表
-                        processed_ips_set = limit_ips(fetched_ip_list, max_ips, limit_mode)
-                    else:
-                        # random或其他模式，先转为set再处理
-                        processed_ips_set = limit_ips(set(fetched_ip_list), max_ips, limit_mode)
-                    logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_set)}")
+                    processed_ips_list = limit_ips(fetched_ip_list, max_ips, limit_mode)
+                    logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_list)}")
                 else:
-                    # 未超限或不限制，直接用抓取到的列表（转为set）
-                    processed_ips_set = set(fetched_ip_list)
-                url_ips_dict[url] = processed_ips_set
+                    processed_ips_list = fetched_ip_list
+                url_ips_dict[url] = processed_ips_list
             else:
                 need_js_urls.append(url)
     return url_ips_dict, need_js_urls
@@ -447,23 +432,23 @@ def get_ip_region(ip: str, api_template: str, timeout: int = 5, max_retries: int
     # 多次失败降级，返回空字符串
     return ''
 
-def filter_ips_by_region(ip_set: Set[str], allowed_regions: list, api_template: str, timeout: int = 5) -> Set[str]:
+def filter_ips_by_region(ip_list: List[str], allowed_regions: list, api_template: str, timeout: int = 5) -> List[str]:
     """
-    只保留指定地区的IP。
-    :param ip_set: 原始IP集合
+    只保留指定地区的IP，保持顺序。
+    :param ip_list: 原始IP列表
     :param allowed_regions: 允许的地区代码列表
     :param api_template: 归属地API模板
     :param timeout: 查询超时时间
-    :return: 过滤后的IP集合
+    :return: 过滤后的IP列表
     """
     if not allowed_regions or not api_template:
-        return ip_set
+        return ip_list
     allowed_set = set([r.upper() for r in allowed_regions if isinstance(r, str)])
-    filtered = set()
-    for ip in ip_set:
+    filtered = []
+    for ip in ip_list:
         region = get_ip_region(ip, api_template, timeout, max_retries=3, retry_interval=1.0)
         if region in allowed_set:
-            filtered.add(ip)
+            filtered.append(ip)
         else:
             logging.info(f"[REGION] 过滤掉IP: {ip}，归属地: {region if region else '未知'}")
     return filtered
@@ -475,14 +460,14 @@ def playwright_dynamic_fetch_worker(args):
     url, pattern, timeout, js_retry, js_retry_interval = args
     from playwright.sync_api import sync_playwright
     session = get_retry_session(timeout)
-    result_ips = set()
+    result_ips = []
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             try:
                 fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
-                result_ips = set(fetched_ip_list_dynamic)
+                result_ips = fetched_ip_list_dynamic
             finally:
                 page.close()
                 browser.close()
@@ -522,18 +507,16 @@ def main() -> None:
         except Exception as e:
             logging.error(f"无法删除旧的输出文件: {output}，错误: {e}")
 
-    # url_ips 存储每个 URL 最终筛选后的 IP 集合
-    url_ips_map: Dict[str, Set[str]] = {} # 修改变量名以避免混淆
+    url_ips_map: Dict[str, List[str]] = {}
     need_js_urls: List[str] = []
     try:
-        # async_static_crawl 返回的已经是限制和处理后的 Dict[str, Set[str]]
         url_ips_map, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
     # 统一用多线程并发处理所有需要JS动态的url
     if need_js_urls:
-        thread_num = min(4, len(need_js_urls))  # 默认最多4线程
+        thread_num = min(4, len(need_js_urls))
         args_list = [
             (url, pattern, timeout, js_retry, js_retry_interval)
             for url in need_js_urls
@@ -544,41 +527,34 @@ def main() -> None:
             for future in as_completed(future_to_url):
                 url, ips = future.result()
                 url_ips_map_dynamic[url] = ips
-        # 合并动态抓取结果
         for url, ips in url_ips_map_dynamic.items():
-            # 应用IP数量限制
-            processed_ips_set_dynamic: Set[str]
+            processed_ips_list: List[str]
             if max_ips_per_url > 0 and len(ips) > max_ips_per_url:
                 original_count = len(ips)
-                if per_url_limit_mode == 'top':
-                    processed_ips_set_dynamic = limit_ips(list(ips), max_ips_per_url, per_url_limit_mode)
-                else:
-                    processed_ips_set_dynamic = limit_ips(ips, max_ips_per_url, per_url_limit_mode)
-                logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_set_dynamic)}")
+                processed_ips_list = limit_ips(ips, max_ips_per_url, per_url_limit_mode)
+                logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_list)}")
             else:
-                processed_ips_set_dynamic = set(ips)
-            url_ips_map[url] = processed_ips_set_dynamic
+                processed_ips_list = ips
+            url_ips_map[url] = processed_ips_list
 
-    # 构建IP排除检查器
-    is_excluded_func = build_ip_exclude_checker(exclude_ips_config) # 使用重命名的配置变量
+    is_excluded_func = build_ip_exclude_checker(exclude_ips_config)
     excluded_count = 0
-            
-    # 合并所有URL的IP集合，并应用排除规则
-    final_all_ips = set() # 修改变量名
-    for url, ips_set_for_url in url_ips_map.items(): # ips_set_for_url 是 Set[str]
-        # 过滤排除的IP
-        original_count_before_exclude = len(ips_set_for_url)
-        # 应用排除规则到每个 URL 的 IP 集合上
-        retained_ips = {ip for ip in ips_set_for_url if not is_excluded_func(ip)}
+
+    # 合并所有URL的IP列表，并应用排除规则，保持顺序
+    merged_ips = []
+    for url, ips_list_for_url in url_ips_map.items():
+        original_count_before_exclude = len(ips_list_for_url)
+        retained_ips = [ip for ip in ips_list_for_url if not is_excluded_func(ip)]
         excluded_in_source = original_count_before_exclude - len(retained_ips)
-        
         if excluded_in_source > 0:
             logging.info(f"[EXCLUDE] URL {url} 排除了 {excluded_in_source} 个IP，保留 {len(retained_ips)} 个IP")
         excluded_count += excluded_in_source
-        
         logging.info(f"URL {url} 贡献了 {len(retained_ips)} 个IP")
-        final_all_ips |= retained_ips
-        
+        merged_ips.extend(retained_ips)
+
+    # 全局有序去重
+    final_all_ips = list(dict.fromkeys(merged_ips))
+
     # 地区过滤
     allowed_regions = config.get('allowed_regions', [])
     ip_geo_api = config.get('ip_geo_api', '')
@@ -587,8 +563,8 @@ def main() -> None:
         final_all_ips = filter_ips_by_region(final_all_ips, allowed_regions, ip_geo_api)
         after_region_count = len(final_all_ips)
         logging.info(f"[REGION] 地区过滤后，IP数量从 {before_region_count} 降至 {after_region_count}")
-        
-    # 保存最终IP集合
+
+    # 保存最终IP列表
     save_ips(final_all_ips, output)
     logging.info(f"最终合并了 {len(url_ips_map)} 个URL的IP，排除了 {excluded_count} 个IP，共 {len(final_all_ips)} 个唯一IP")
 
