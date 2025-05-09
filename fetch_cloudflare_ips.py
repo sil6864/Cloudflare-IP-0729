@@ -41,10 +41,12 @@ except ImportError:
 
 # ===== 常量定义 =====
 USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-DEFAULT_JS_TIMEOUT: int = 30000
-DEFAULT_WAIT_TIMEOUT: int = 5000
+DEFAULT_JS_TIMEOUT: int = 60000  # 将默认超时增加到60秒
+DEFAULT_WAIT_TIMEOUT: int = 8000  # 将默认等待时间增加到8秒
+EXTENDED_WAIT_TIMEOUT: int = 15000  # 特定网站的额外等待时间（15秒）
 MIN_IP_BLOCK: int = 3
 MAX_THREAD_NUM: int = 4
+SPECIAL_DOMAINS = ['stock.hostmonit.com', 'cf.090227.xyz']  # 需要特殊处理的域名
 
 # ===== 配置区 =====
 # 所有配置均从 config.yaml 读取，缺失项直接报错
@@ -511,6 +513,8 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
     """
     url, pattern, timeout, js_retry, js_retry_interval, selector = args
     from playwright.sync_api import sync_playwright
+    from urllib.parse import urlparse
+    
     session = get_retry_session(timeout)
     result_ips = []
     try:
@@ -518,9 +522,35 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             try:
+                # 检查是否为特殊域名，需要额外等待
+                parsed_url = urlparse(url)
+                domain = parsed_url.netloc
+                is_special_domain = any(special_domain in domain for special_domain in SPECIAL_DOMAINS)
+                
+                # 访问页面
+                logging.info(f"[PLAYWRIGHT] 正在访问: {url} {'(特殊域名，延长等待时间)' if is_special_domain else ''}")
                 page.goto(url, timeout=DEFAULT_JS_TIMEOUT)
+                
+                # 特殊域名需要更长的等待时间
+                if is_special_domain:
+                    logging.info(f"[PLAYWRIGHT] 特殊域名 {domain}，额外等待 {EXTENDED_WAIT_TIMEOUT/1000} 秒")
+                    page.wait_for_timeout(EXTENDED_WAIT_TIMEOUT)
+                else:
+                    page.wait_for_timeout(DEFAULT_WAIT_TIMEOUT)
+                
+                # 尝试等待表格元素加载（特别是对stock.hostmonit.com）
+                if 'stock.hostmonit.com' in domain:
+                    try:
+                        logging.info("[PLAYWRIGHT] 尝试等待表格元素加载...")
+                        page.wait_for_selector('table', timeout=10000)
+                        logging.info("[PLAYWRIGHT] 表格元素已加载")
+                    except Exception as e:
+                        logging.warning(f"[PLAYWRIGHT] 等待表格元素超时: {e}")
+                
                 ip_list = []
                 selector_success = False
+                
+                # 使用选择器提取IP（如果指定了选择器）
                 if selector:
                     try:
                         page.wait_for_selector(selector, timeout=20000)
@@ -529,21 +559,90 @@ def playwright_dynamic_fetch_worker(args: tuple) -> tuple:
                             ip_list.extend(re.findall(pattern, elem.inner_text()))
                         logging.info(f"[EXTRACT] 使用selector '{selector}' 提取到{len(ip_list)}个IP")
                         selector_success = len(ip_list) > 0
-                    except Exception:
-                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，自动降级为全局遍历")
-                if not selector or not selector_success:
-                    # 遍历table、div等常见结构，补充全局遍历
+                    except Exception as e:
+                        logging.warning(f"[PLAYWRIGHT] 未检测到selector {selector}，自动降级为全局遍历: {e}")
+                
+                # 特殊处理stock.hostmonit.com
+                if 'stock.hostmonit.com' in domain:
+                    try:
+                        # 直接定位IP列
+                        ip_cells = page.query_selector_all('table tr td:nth-child(2)')  # IP通常在第2列
+                        for cell in ip_cells:
+                            cell_text = cell.inner_text()
+                            # 验证是否为有效IP格式
+                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', cell_text):
+                                ip_list.append(cell_text)
+                        logging.info(f"[EXTRACT] 特殊处理stock.hostmonit.com提取到{len(ip_list)}个IP")
+                        if len(ip_list) > 0:
+                            # 如果成功提取了IP，就跳过常规处理
+                            result_ips = list(dict.fromkeys(ip_list))
+                            logging.info(f"[DEBUG] {url} 特殊处理提取到IP: {result_ips[:10]}")
+                            return url, result_ips
+                    except Exception as e:
+                        logging.warning(f"[PLAYWRIGHT] 特殊处理失败: {e}")
+                
+                # 常规处理：遍历table、div等常见结构，补充全局遍历
+                if not selector_success:
+                    # 保存页面HTML用于调试（仅在DEBUG级别日志时）
+                    if logging.getLogger().level <= logging.DEBUG:
+                        html_content = page.content()
+                        debug_file = f"debug_{domain.replace('.', '_')}.html"
+                        with open(debug_file, 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+                        logging.debug(f"[DEBUG] 已保存页面HTML到 {debug_file}")
+                    
+                    # 尝试提取table中的IP
+                    table_ips = []
                     for row in page.query_selector_all('table tr'):
                         for cell in row.query_selector_all('td'):
-                            ip_list.extend(re.findall(pattern, cell.inner_text()))
-                    logging.info(f"[EXTRACT] table遍历提取到{len(ip_list)}个IP")
+                            table_ips.extend(re.findall(pattern, cell.inner_text()))
+                    logging.info(f"[EXTRACT] table遍历提取到{len(table_ips)}个IP")
+                    
+                    # 检查提取的table IP是否有效（避免1.0.1.1这样的占位符IP）
+                    valid_table_ips = [ip for ip in table_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
+                    if len(valid_table_ips) > 0:
+                        ip_list.extend(valid_table_ips)
+                        logging.info(f"[EXTRACT] table有效IP: {len(valid_table_ips)}个")
+                    else:
+                        ip_list.extend(table_ips)
+                    
+                    # 提取div中的IP
+                    div_ips = []
                     for elem in page.query_selector_all('div'):
-                        ip_list.extend(re.findall(pattern, elem.inner_text()))
-                    logging.info(f"[EXTRACT] div遍历提取到{len(ip_list)}个IP")
+                        div_ips.extend(re.findall(pattern, elem.inner_text()))
+                    logging.info(f"[EXTRACT] div遍历提取到{len(div_ips)}个IP")
+                    
+                    # 检查提取的div IP是否有效
+                    valid_div_ips = [ip for ip in div_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
+                    if len(valid_div_ips) > 0:
+                        ip_list.extend(valid_div_ips)
+                        logging.info(f"[EXTRACT] div有效IP: {len(valid_div_ips)}个")
+                    else:
+                        ip_list.extend(div_ips)
+                    
+                    # 全局遍历
                     all_text = page.content()
-                    ip_list.extend(re.findall(pattern, all_text))
-                    logging.info(f"[EXTRACT] 全局遍历提取到{len(ip_list)}个IP")
-                result_ips = ip_list
+                    global_ips = re.findall(pattern, all_text)
+                    logging.info(f"[EXTRACT] 全局遍历提取到{len(global_ips)}个IP")
+                    
+                    # 检查全局IP是否有效
+                    valid_global_ips = [ip for ip in global_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
+                    if len(valid_global_ips) > 0:
+                        ip_list.extend(valid_global_ips)
+                        logging.info(f"[EXTRACT] 全局有效IP: {len(valid_global_ips)}个")
+                    else:
+                        ip_list.extend(global_ips)
+                
+                # 去重并过滤无效IP
+                all_ips = list(dict.fromkeys(ip_list))
+                valid_ips = [ip for ip in all_ips if not (ip.startswith('1.0.') or ip.startswith('1.2.'))]
+                
+                if len(valid_ips) > 0:
+                    logging.info(f"[EXTRACT] 过滤掉 {len(all_ips) - len(valid_ips)} 个疑似无效IP")
+                    result_ips = valid_ips
+                else:
+                    result_ips = all_ips
+                
                 logging.info(f"[DEBUG] {url} 动态抓取前10个IP: {result_ips[:10]}")
             finally:
                 page.close()
