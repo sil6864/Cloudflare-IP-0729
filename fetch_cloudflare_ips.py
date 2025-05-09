@@ -129,12 +129,13 @@ def fetch_ip_auto(
 ) -> List[str]:
     logging.info(f"[AUTO] 正在抓取: {url}")
     extracted_ips: List[str] = []
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     try:
-        response = session.get(url)
+        headers = {"User-Agent": user_agent}
+        response = session.get(url, headers=headers)
         response.raise_for_status()
         content_type = response.headers.get('Content-Type', '').lower()
         text = response.text
-        # 智能判断内容类型
         if 'text/html' in content_type or '<html' in text.lower():
             soup = BeautifulSoup(text, 'html.parser')
             ip_list: List[str] = []
@@ -150,7 +151,6 @@ def fetch_ip_auto(
             extracted_ips = list(dict.fromkeys(ip_list))
             logging.info(f"[DEBUG] {url} 静态抓取前10个IP: {extracted_ips[:10]}")
         else:
-            # 纯文本或未知类型，直接正则提取
             ip_list = extract_ips(text, pattern)
             extracted_ips = list(dict.fromkeys(ip_list))
             logging.info(f"[DEBUG] {url} 纯文本抓取前10个IP: {extracted_ips[:10]}")
@@ -163,8 +163,11 @@ def fetch_ip_auto(
         logging.warning(f"[AUTO] 静态抓取失败: {url}，网络错误: {e}，尝试JS动态")
     except Exception as e:
         logging.warning(f"[AUTO] 静态抓取失败: {url}，解析错误: {e}，尝试JS动态")
-    # 动态抓取部分同理
     if page is not None:
+        try:
+            page.set_extra_http_headers({"User-Agent": user_agent})
+        except Exception:
+            pass
         for attempt in range(1, js_retry + 1):
             try:
                 page.goto(url, timeout=30000)
@@ -212,7 +215,9 @@ async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: a
     :return: (url, IP列表 (有序且唯一), 是否成功)
     """
     try:
-        async with session.get(url, timeout=timeout) as response:
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        headers = {"User-Agent": user_agent}
+        async with session.get(url, timeout=timeout, headers=headers) as response:
             if response.status != 200:
                 logging.warning(f"[ASYNC] 静态抓取失败: {url}，HTTP状态码: {response.status}")
                 return (url, [], False)
