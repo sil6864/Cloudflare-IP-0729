@@ -47,7 +47,7 @@ sources:
   - https://ip.164746.xyz
   - https://cf.090227.xyz
   - https://stock.hostmonit.com/CloudFlareYes
-pattern: "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+pattern: '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
 output: "ip.txt"
 timeout: 10
 log: "fetch_cloudflare_ips.log"
@@ -55,6 +55,8 @@ max_workers: 4
 log_level: "INFO"
 js_retry: 3              # JS动态抓取最大重试次数
 js_retry_interval: 2.0   # JS动态抓取重试间隔（秒）
+max_ips_per_url: 100     # 每个URL最多保留多少个IP（0表示不限制）
+per_url_limit_mode: "random"  # 超出限制时的筛选模式: random-随机保留, top-保留靠前的
 ```
 
 优先级：命令行参数 > 配置文件 > 默认值
@@ -81,6 +83,10 @@ js_retry_interval: 2.0   # JS动态抓取重试间隔（秒）
     - 全量类型注解覆盖，PEP8格式化，关键函数补充注释
     - 细化网络、解析、文件写入等异常处理，提升健壮性
     - 代码风格与规范全面提升，便于维护和扩展
+  - **2024-07-xx：**
+    - 添加 IP 数量限制功能，支持每个 URL 的 IP 数量上限设置
+    - 支持两种截取模式：随机和保留靠前
+    - 完善日志输出，清晰展示 IP 限制过程
 
 ## 其他说明
 - 如需扩展更多 JS 动态页面抓取，可参考 fetch_js_ips 函数实现

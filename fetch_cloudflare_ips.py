@@ -45,6 +45,13 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
             for k in required:
                 if k not in config:
                     raise KeyError(f'config.yaml 缺少必需字段: {k}')
+            
+            # 新增配置项默认值
+            if 'max_ips_per_url' not in config:
+                config['max_ips_per_url'] = 0  # 默认不限制
+            if 'per_url_limit_mode' not in config:
+                config['per_url_limit_mode'] = 'random'  # 默认随机保留
+                
             return config
     except Exception as e:
         raise RuntimeError(f"读取配置文件失败: {e}")
@@ -201,15 +208,41 @@ async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: a
         logging.warning(f"[ASYNC] 静态抓取失败: {url}，错误: {e}，加入JS动态队列")
         return (url, set(), False)
 
-async def async_static_crawl(sources: List[str], pattern: str, timeout: int) -> tuple[Set[str], List[str]]:
+# ---------------- 新增：IP数量限制 ----------------
+def limit_ips(ip_set: Set[str], max_count: int, mode: str = 'random') -> Set[str]:
     """
-    并发抓取所有静态页面，返回所有IP和需要JS动态抓取的URL。
+    限制IP集合的数量，根据指定模式返回有限的IP集合。
+    :param ip_set: 原始IP集合
+    :param max_count: 最大保留数量，0表示不限制
+    :param mode: 限制模式，'random'为随机保留，'top'为保留靠前的
+    :return: 限制后的IP集合
+    """
+    if max_count <= 0 or len(ip_set) <= max_count:
+        return ip_set
+    
+    if mode == 'random':
+        # 随机选择指定数量的IP
+        import random
+        return set(random.sample(list(ip_set), max_count))
+    elif mode == 'top':
+        # 按字典序保留靠前的IP
+        return set(sorted(ip_set)[:max_count])
+    else:
+        logging.warning(f"未知的限制模式: {mode}，使用默认的随机模式")
+        import random
+        return set(random.sample(list(ip_set), max_count))
+
+async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, Set[str]], List[str]]:
+    """
+    并发抓取所有静态页面，返回每个URL的IP集合和需要JS动态抓取的URL。
     :param sources: URL列表
     :param pattern: IP正则
     :param timeout: 超时时间
-    :return: (全部唯一IP集合, 需要JS动态抓取的URL列表)
+    :param max_ips: 每个URL最多保留的IP数量，0表示不限制
+    :param limit_mode: 限制模式，'random'为随机保留，'top'为保留靠前的
+    :return: (每个URL的IP集合字典, 需要JS动态抓取的URL列表)
     """
-    all_ips: Set[str] = set()
+    url_ips: Dict[str, Set[str]] = {}
     need_js_urls: List[str] = []
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -217,10 +250,15 @@ async def async_static_crawl(sources: List[str], pattern: str, timeout: int) -> 
         results = await asyncio.gather(*tasks)
         for url, ip_set, success in results:
             if success:
-                all_ips |= ip_set
+                # 如果设置了IP数量限制，应用限制
+                if max_ips > 0 and len(ip_set) > max_ips:
+                    original_count = len(ip_set)
+                    ip_set = limit_ips(ip_set, max_ips, limit_mode)
+                    logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(ip_set)}")
+                url_ips[url] = ip_set
             else:
                 need_js_urls.append(url)
-    return all_ips, need_js_urls
+    return url_ips, need_js_urls
 
 # ---------------- 主流程 ----------------
 def main() -> None:
@@ -242,6 +280,8 @@ def main() -> None:
     log_level = config['log_level']
     js_retry = config['js_retry']
     js_retry_interval = config['js_retry_interval']
+    max_ips_per_url = config['max_ips_per_url']
+    per_url_limit_mode = config['per_url_limit_mode']
 
     setup_logging(log_file, log_level)
     # 若输出文件已存在，先删除
@@ -252,10 +292,10 @@ def main() -> None:
             logging.error(f"无法删除旧的输出文件: {output}，错误: {e}")
 
     # 异步并发静态抓取
-    all_ips: Set[str] = set()
+    url_ips: Dict[str, Set[str]] = {}
     need_js_urls: List[str] = []
     try:
-        all_ips, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout))
+        url_ips, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
@@ -268,14 +308,28 @@ def main() -> None:
                 page = browser.new_page()
                 try:
                     for url in need_js_urls:
-                        all_ips |= fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                        ip_set = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                        # 应用IP数量限制
+                        if max_ips_per_url > 0 and len(ip_set) > max_ips_per_url:
+                            original_count = len(ip_set)
+                            ip_set = limit_ips(ip_set, max_ips_per_url, per_url_limit_mode)
+                            logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(ip_set)}")
+                        url_ips[url] = ip_set
                 finally:
                     page.close()
                     browser.close()
         except Exception as e:
             logging.error(f"Playwright 启动或抓取失败: {e}")
+            
+    # 合并所有URL的IP集合
+    all_ips = set()
+    for url, ips in url_ips.items():
+        logging.info(f"URL {url} 贡献了 {len(ips)} 个IP")
+        all_ips |= ips
+        
     # 保存最终IP集合
     save_ips(all_ips, output)
+    logging.info(f"最终合并了 {len(url_ips)} 个URL的IP，共 {len(all_ips)} 个唯一IP")
 
 if __name__ == '__main__':
     main() 

@@ -13,4 +13,6 @@ log: "fetch_cloudflare_ips.log"   # 日志文件名
 max_workers: 4           # 并发线程数，控制静态抓取并发量
 log_level: "INFO"        # 日志等级（DEBUG/INFO/WARNING/ERROR）
 js_retry: 3              # JS动态抓取最大重试次数
-js_retry_interval: 2.0   # JS动态抓取重试间隔（秒） 
+js_retry_interval: 2.0   # JS动态抓取重试间隔（秒）
+max_ips_per_url: 10    # 每个URL最多保留多少个IP（0表示不限制）
+per_url_limit_mode: "top"  # 超出限制时的筛选模式: random-随机保留, top-保留靠前的 
