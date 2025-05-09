@@ -1,0 +1,45 @@
+name: Update IP List
+
+on:
+  schedule:
+    - cron: '0 */8 * * *' # 每8小时运行一次
+  workflow_dispatch: # 允许手动触发
+  push: # 允许提交触发
+
+jobs:
+
+  update-ip-list:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -c "import yaml; reqs = yaml.safe_load(open('config.yaml', encoding='utf-8'))['requirements']; import subprocess; [subprocess.run(['pip', 'install', r]) for r in reqs]"
+        
+    - name: Install Playwright browsers
+      run: |
+        python -m playwright install
+        
+    - name: Run script
+      run: |
+        set -e
+        python fetch_cloudflare_ips.py
+        
+    - name: Commit and push changes
+      run: |
+        git config --global user.email "tianshideyou@proton.me"
+        git config --global user.name "tianshipapa"
+        if [ -n "$(git status --porcelain)" ]; then
+          git add ip.txt
+          git commit -m "Automatic update"
+          git push
+        else
+          echo "No changes detected, skipping commit." 
