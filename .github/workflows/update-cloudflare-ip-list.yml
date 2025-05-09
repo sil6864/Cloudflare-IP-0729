@@ -33,12 +33,12 @@ jobs:
 
       - name: Commit and push changes
         run: |
-          echo "Line 1 of test"
-          echo "Line 2 of test"
-          echo "Line 3 of test"
-          echo "Line 4 of test"
-          echo "Line 5 of test"
-          echo "Line 6 of test"
-          echo "Line 7 of test"
-          echo "Line 8 of test"
-          echo "Line 9 of test - End"
+          git config --global user.email "tianshideyou@proton.me"
+          git config --global user.name "tianshipapa"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add ip.txt
+            git commit -m "Automatic update"
+            git push
+          else
+            echo "No changes detected, skipping commit."
+          fi
