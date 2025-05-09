@@ -4,8 +4,9 @@ import re
 import logging
 import argparse
 import time
-from typing import List, Set, Optional, Dict, Any
+from typing import List, Set, Optional, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ipaddress  # 新增: 用于支持CIDR格式网段判断
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -51,6 +52,8 @@ def load_config(config_path: str = 'config.yaml') -> Dict[str, Any]:
                 config['max_ips_per_url'] = 0  # 默认不限制
             if 'per_url_limit_mode' not in config:
                 config['per_url_limit_mode'] = 'random'  # 默认随机保留
+            if 'exclude_ips' not in config:
+                config['exclude_ips'] = []  # 默认不排除任何IP
                 
             return config
     except Exception as e:
@@ -75,14 +78,14 @@ def setup_logging(log_file: str, log_level: str = 'INFO') -> None:
     )
 
 # ---------------- 工具函数 ----------------
-def extract_ips(text: str, pattern: str) -> Set[str]:
+def extract_ips(text: str, pattern: str) -> List[str]:
     """
-    从文本中提取所有IP地址。
+    从文本中提取所有IP地址，并保持原始顺序。
     :param text: 输入文本
     :param pattern: IP正则表达式
-    :return: IP集合
+    :return: IP列表 (按找到的顺序)
     """
-    return set(re.findall(pattern, text))
+    return re.findall(pattern, text)
 
 def save_ips(ip_set: Set[str], filename: str) -> None:
     """
@@ -123,9 +126,10 @@ def fetch_ip_auto(
     page: Optional[Page] = None,
     js_retry: int = 3,
     js_retry_interval: float = 2.0
-) -> Set[str]:
+) -> List[str]:
     """
     自动判断页面类型并抓取IP，优先静态，失败后用JS动态。
+    返回的IP列表会保持页面上的大致顺序并去重。
     :param url: 目标URL
     :param pattern: IP正则
     :param timeout: 超时时间
@@ -133,21 +137,23 @@ def fetch_ip_auto(
     :param page: Playwright Page对象
     :param js_retry: JS动态抓取最大重试次数
     :param js_retry_interval: JS动态抓取重试间隔（秒）
-    :return: IP集合
+    :return: IP列表 (有序且唯一)
     """
     logging.info(f"[AUTO] 正在抓取: {url}")
+    extracted_ips: List[str] = []
     # 先尝试静态抓取
     try:
         response = session.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-        ip_set: Set[str] = set()
+        current_ips: List[str] = []
         for element in elements:
-            ip_set |= extract_ips(element.get_text(), pattern)
-        if ip_set:
-            logging.info(f"[AUTO] 静态抓取成功: {url}，共{len(ip_set)}个IP")
-            return ip_set
+            current_ips.extend(extract_ips(element.get_text(), pattern))
+        if current_ips:
+            extracted_ips = list(dict.fromkeys(current_ips)) # 去重并保持顺序
+            logging.info(f"[AUTO] 静态抓取成功: {url}，共{len(extracted_ips)}个IP")
+            return extracted_ips
         else:
             logging.info(f"[AUTO] 静态抓取无IP，尝试JS动态: {url}")
     except requests.RequestException as e:
@@ -160,10 +166,12 @@ def fetch_ip_auto(
             try:
                 page.goto(url, timeout=30000)
                 page.wait_for_timeout(3000)
-                ip_set = extract_ips(page.content(), pattern)
-                if ip_set:
-                    logging.info(f"[AUTO] JS动态抓取成功: {url}，共{len(ip_set)}个IP")
-                    return ip_set
+                # 动态抓取直接从整个页面内容提取，顺序由 re.findall 保证
+                current_ips = extract_ips(page.content(), pattern)
+                if current_ips:
+                    extracted_ips = list(dict.fromkeys(current_ips)) # 去重并保持顺序
+                    logging.info(f"[AUTO] JS动态抓取成功: {url}，共{len(extracted_ips)}个IP")
+                    return extracted_ips
                 else:
                     logging.warning(f"[AUTO] JS动态抓取无IP: {url}，第{attempt}次")
             except Exception as e:
@@ -173,64 +181,75 @@ def fetch_ip_auto(
         logging.error(f"[AUTO] JS动态抓取多次失败: {url}")
     else:
         logging.error(f"[AUTO] 未提供page对象，无法进行JS动态抓取: {url}")
-    return set()
+    return [] # 返回空列表表示没有找到
 
-async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession) -> tuple[str, Set[str], bool]:
+async def fetch_ip_static_async(url: str, pattern: str, timeout: int, session: aiohttp.ClientSession) -> tuple[str, List[str], bool]:
     """
-    异步静态页面抓取任务，返回(url, IP集合, 是否成功)。
+    异步静态页面抓取任务，返回(url, IP列表 (有序且唯一), 是否成功)。
     :param url: 目标URL
     :param pattern: IP正则
     :param timeout: 超时时间
     :param session: aiohttp.ClientSession
-    :return: (url, IP集合, 是否成功)
+    :return: (url, IP列表 (有序且唯一), 是否成功)
     """
     try:
         async with session.get(url, timeout=timeout) as response:
             if response.status != 200:
                 logging.warning(f"[ASYNC] 静态抓取失败: {url}，HTTP状态码: {response.status}")
-                return (url, set(), False)
+                return (url, [], False)
             text = await response.text()
             soup = BeautifulSoup(text, 'html.parser')
             elements = soup.find_all('tr') if soup.find_all('tr') else soup.find_all('li')
-            ip_set: Set[str] = set()
+            ip_list: List[str] = []
             for element in elements:
-                ip_set |= extract_ips(element.get_text(), pattern)
-            if ip_set:
-                logging.info(f"[ASYNC] 静态抓取成功: {url}，共{len(ip_set)}个IP")
-                return (url, ip_set, True)
+                ip_list.extend(extract_ips(element.get_text(), pattern))
+            
+            ordered_unique_ips: List[str] = []
+            if ip_list:
+                ordered_unique_ips = list(dict.fromkeys(ip_list)) # 去重并保持顺序
+                logging.info(f"[ASYNC] 静态抓取成功: {url}，共{len(ordered_unique_ips)}个IP")
+                return (url, ordered_unique_ips, True)
             else:
                 logging.info(f"[ASYNC] 静态抓取无IP，加入JS动态队列: {url}")
-                return (url, set(), False)
+                return (url, [], False)
     except asyncio.TimeoutError:
         logging.warning(f"[ASYNC] 静态抓取超时: {url}，加入JS动态队列")
-        return (url, set(), False)
+        return (url, [], False)
     except Exception as e:
         logging.warning(f"[ASYNC] 静态抓取失败: {url}，错误: {e}，加入JS动态队列")
-        return (url, set(), False)
+        return (url, [], False)
 
 # ---------------- 新增：IP数量限制 ----------------
-def limit_ips(ip_set: Set[str], max_count: int, mode: str = 'random') -> Set[str]:
+def limit_ips(ip_collection: Union[List[str], Set[str]], max_count: int, mode: str = 'random') -> Set[str]:
     """
-    限制IP集合的数量，根据指定模式返回有限的IP集合。
-    :param ip_set: 原始IP集合
+    限制IP集合/列表的数量，根据指定模式返回有限的IP集合。
+    :param ip_collection: 原始IP列表 (用于top模式，需保持顺序) 或集合 (用于random模式)
     :param max_count: 最大保留数量，0表示不限制
-    :param mode: 限制模式，'random'为随机保留，'top'为保留靠前的
+    :param mode: 限制模式，'random'为随机保留，'top'为保留页面靠前的
     :return: 限制后的IP集合
     """
-    if max_count <= 0 or len(ip_set) <= max_count:
-        return ip_set
+    collection_len = len(ip_collection)
     
-    if mode == 'random':
-        # 随机选择指定数量的IP
-        import random
-        return set(random.sample(list(ip_set), max_count))
-    elif mode == 'top':
-        # 按字典序保留靠前的IP
-        return set(sorted(ip_set)[:max_count])
+    if max_count <= 0 or collection_len <= max_count:
+        # 如果不限制或数量已在限制内，确保返回的是Set类型
+        if isinstance(ip_collection, list):
+            return set(ip_collection)
+        return ip_collection # 已经是Set
+
+    if mode == 'top':
+        if isinstance(ip_collection, list):
+            # 如果是列表（期望的输入），按原始顺序取top N
+            return set(ip_collection[:max_count])
+        else:
+            # 如果错误地传入了set，则退回按字典序排序（旧行为）
+            logging.warning("[LIMIT] Top mode 收到 Set 类型输入，将按字典序排序选取。")
+            return set(sorted(list(ip_collection))[:max_count])
+    elif mode == 'random':
+        # 随机模式，确保输入是列表以便采样
+        return set(random.sample(list(ip_collection), max_count))
     else:
-        logging.warning(f"未知的限制模式: {mode}，使用默认的随机模式")
-        import random
-        return set(random.sample(list(ip_set), max_count))
+        logging.warning(f"[LIMIT] 未知的限制模式: {mode}，使用默认的随机模式")
+        return set(random.sample(list(ip_collection), max_count))
 
 async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max_ips: int = 0, limit_mode: str = 'random') -> tuple[Dict[str, Set[str]], List[str]]:
     """
@@ -239,26 +258,83 @@ async def async_static_crawl(sources: List[str], pattern: str, timeout: int, max
     :param pattern: IP正则
     :param timeout: 超时时间
     :param max_ips: 每个URL最多保留的IP数量，0表示不限制
-    :param limit_mode: 限制模式，'random'为随机保留，'top'为保留靠前的
+    :param limit_mode: 限制模式，'random'为随机保留，'top'为保留页面靠前的
     :return: (每个URL的IP集合字典, 需要JS动态抓取的URL列表)
     """
-    url_ips: Dict[str, Set[str]] = {}
+    url_ips_dict: Dict[str, Set[str]] = {} # 修改变量名以避免与外部的url_ips混淆
     need_js_urls: List[str] = []
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_ip_static_async(url, pattern, timeout, session) for url in sources]
         results = await asyncio.gather(*tasks)
-        for url, ip_set, success in results:
+        for url, fetched_ip_list, success in results: # fetched_ip_list 是 List[str]
             if success:
-                # 如果设置了IP数量限制，应用限制
-                if max_ips > 0 and len(ip_set) > max_ips:
-                    original_count = len(ip_set)
-                    ip_set = limit_ips(ip_set, max_ips, limit_mode)
-                    logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(ip_set)}")
-                url_ips[url] = ip_set
+                processed_ips_set: Set[str]
+                if max_ips > 0 and len(fetched_ip_list) > max_ips:
+                    original_count = len(fetched_ip_list)
+                    if limit_mode == 'top':
+                        # top模式直接使用有序列表
+                        processed_ips_set = limit_ips(fetched_ip_list, max_ips, limit_mode)
+                    else:
+                        # random或其他模式，先转为set再处理
+                        processed_ips_set = limit_ips(set(fetched_ip_list), max_ips, limit_mode)
+                    logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_set)}")
+                else:
+                    # 未超限或不限制，直接用抓取到的列表（转为set）
+                    processed_ips_set = set(fetched_ip_list)
+                url_ips_dict[url] = processed_ips_set
             else:
                 need_js_urls.append(url)
-    return url_ips, need_js_urls
+    return url_ips_dict, need_js_urls
+
+# ---------------- 新增：IP排除功能 ----------------
+def build_ip_exclude_checker(exclude_patterns: List[str]) -> callable:
+    """
+    构建IP排除检查器，支持精确匹配和CIDR格式网段匹配。
+    :param exclude_patterns: 排除IP/网段列表
+    :return: 检查函数，接收IP字符串，返回是否应该排除
+    """
+    if not exclude_patterns:
+        # 没有排除规则，返回始终为False的函数
+        return lambda ip: False
+    
+    # 预处理排除列表，分为精确匹配和网段匹配
+    exact_ips = set()
+    networks = []
+    
+    for pattern in exclude_patterns:
+        pattern = pattern.strip()
+        if '/' in pattern:
+            # CIDR格式网段
+            try:
+                networks.append(ipaddress.ip_network(pattern, strict=False))
+            except ValueError as e:
+                logging.warning(f"无效的CIDR格式网段: {pattern}, 错误: {e}")
+        else:
+            # 精确匹配的IP
+            exact_ips.add(pattern)
+    
+    def is_excluded(ip: str) -> bool:
+        """
+        检查IP是否应被排除。
+        :param ip: IP地址字符串
+        :return: 如果应该排除则为True，否则为False
+        """
+        # 先检查精确匹配
+        if ip in exact_ips:
+            return True
+        
+        # 再检查网段匹配
+        if networks:
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+                return any(ip_obj in network for network in networks)
+            except ValueError:
+                logging.warning(f"无效的IP地址: {ip}")
+        
+        return False
+    
+    return is_excluded
 
 # ---------------- 主流程 ----------------
 def main() -> None:
@@ -282,7 +358,8 @@ def main() -> None:
     js_retry_interval = config['js_retry_interval']
     max_ips_per_url = config['max_ips_per_url']
     per_url_limit_mode = config['per_url_limit_mode']
-
+    exclude_ips_config = config['exclude_ips'] # 重命名以区分函数
+    
     setup_logging(log_file, log_level)
     # 若输出文件已存在，先删除
     if os.path.exists(output):
@@ -291,11 +368,12 @@ def main() -> None:
         except Exception as e:
             logging.error(f"无法删除旧的输出文件: {output}，错误: {e}")
 
-    # 异步并发静态抓取
-    url_ips: Dict[str, Set[str]] = {}
+    # url_ips 存储每个 URL 最终筛选后的 IP 集合
+    url_ips_map: Dict[str, Set[str]] = {} # 修改变量名以避免混淆
     need_js_urls: List[str] = []
     try:
-        url_ips, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
+        # async_static_crawl 返回的已经是限制和处理后的 Dict[str, Set[str]]
+        url_ips_map, need_js_urls = asyncio.run(async_static_crawl(sources, pattern, timeout, max_ips_per_url, per_url_limit_mode))
     except Exception as e:
         logging.error(f"异步静态抓取流程异常: {e}")
 
@@ -308,28 +386,51 @@ def main() -> None:
                 page = browser.new_page()
                 try:
                     for url in need_js_urls:
-                        ip_set = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                        # fetch_ip_auto 返回 List[str]
+                        fetched_ip_list_dynamic = fetch_ip_auto(url, pattern, timeout, session, page, js_retry, js_retry_interval)
+                        processed_ips_set_dynamic: Set[str]
                         # 应用IP数量限制
-                        if max_ips_per_url > 0 and len(ip_set) > max_ips_per_url:
-                            original_count = len(ip_set)
-                            ip_set = limit_ips(ip_set, max_ips_per_url, per_url_limit_mode)
-                            logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(ip_set)}")
-                        url_ips[url] = ip_set
+                        if max_ips_per_url > 0 and len(fetched_ip_list_dynamic) > max_ips_per_url:
+                            original_count = len(fetched_ip_list_dynamic)
+                            if per_url_limit_mode == 'top':
+                                # top模式直接使用有序列表
+                                processed_ips_set_dynamic = limit_ips(fetched_ip_list_dynamic, max_ips_per_url, per_url_limit_mode)
+                            else:
+                                # random或其他模式，先转为set再处理
+                                processed_ips_set_dynamic = limit_ips(set(fetched_ip_list_dynamic), max_ips_per_url, per_url_limit_mode)
+                            logging.info(f"[LIMIT] URL {url} IP数量从 {original_count} 限制为 {len(processed_ips_set_dynamic)}")
+                        else:
+                            processed_ips_set_dynamic = set(fetched_ip_list_dynamic)
+                        url_ips_map[url] = processed_ips_set_dynamic # 添加或更新动态抓取的IP
                 finally:
                     page.close()
                     browser.close()
         except Exception as e:
             logging.error(f"Playwright 启动或抓取失败: {e}")
             
-    # 合并所有URL的IP集合
-    all_ips = set()
-    for url, ips in url_ips.items():
-        logging.info(f"URL {url} 贡献了 {len(ips)} 个IP")
-        all_ips |= ips
+    # 构建IP排除检查器
+    is_excluded_func = build_ip_exclude_checker(exclude_ips_config) # 使用重命名的配置变量
+    excluded_count = 0
+            
+    # 合并所有URL的IP集合，并应用排除规则
+    final_all_ips = set() # 修改变量名
+    for url, ips_set_for_url in url_ips_map.items(): # ips_set_for_url 是 Set[str]
+        # 过滤排除的IP
+        original_count_before_exclude = len(ips_set_for_url)
+        # 应用排除规则到每个 URL 的 IP 集合上
+        retained_ips = {ip for ip in ips_set_for_url if not is_excluded_func(ip)}
+        excluded_in_source = original_count_before_exclude - len(retained_ips)
+        
+        if excluded_in_source > 0:
+            logging.info(f"[EXCLUDE] URL {url} 排除了 {excluded_in_source} 个IP，保留 {len(retained_ips)} 个IP")
+        excluded_count += excluded_in_source
+        
+        logging.info(f"URL {url} 贡献了 {len(retained_ips)} 个IP")
+        final_all_ips |= retained_ips
         
     # 保存最终IP集合
-    save_ips(all_ips, output)
-    logging.info(f"最终合并了 {len(url_ips)} 个URL的IP，共 {len(all_ips)} 个唯一IP")
+    save_ips(final_all_ips, output)
+    logging.info(f"最终合并了 {len(url_ips_map)} 个URL的IP，排除了 {excluded_count} 个IP，共 {len(final_all_ips)} 个唯一IP")
 
 if __name__ == '__main__':
     main() 

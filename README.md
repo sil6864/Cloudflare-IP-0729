@@ -55,8 +55,11 @@ max_workers: 4
 log_level: "INFO"
 js_retry: 3              # JS动态抓取最大重试次数
 js_retry_interval: 2.0   # JS动态抓取重试间隔（秒）
-max_ips_per_url: 100     # 每个URL最多保留多少个IP（0表示不限制）
-per_url_limit_mode: "random"  # 超出限制时的筛选模式: random-随机保留, top-保留靠前的
+max_ips_per_url: 10      # 每个URL最多保留多少个IP（0表示不限制）
+per_url_limit_mode: "top"  # 超出限制时的筛选模式: random-随机保留, top-保留页面上实际靠前的IP
+exclude_ips:           # 排除IP列表，支持单个IP和CIDR格式网段
+  - "127.0.0.1"        # 排除单个IP，精确匹配
+  - "192.168.1.0/24"   # 排除整个网段，CIDR格式
 ```
 
 优先级：命令行参数 > 配置文件 > 默认值
@@ -87,6 +90,9 @@ per_url_limit_mode: "random"  # 超出限制时的筛选模式: random-随机保
     - 添加 IP 数量限制功能，支持每个 URL 的 IP 数量上限设置
     - 支持两种截取模式：随机和保留靠前
     - 完善日志输出，清晰展示 IP 限制过程
+    - 添加 IP 排除功能，支持精确匹配和 CIDR 网段匹配
+    - 自动跳过排除列表中的 IP，提升结果质量
+    - 优化 `top` 模式的 IP 筛选逻辑，使其真正按照 IP 在源页面上的出现顺序（排名）进行选择，而非简单的字典序排序。
 
 ## 其他说明
 - 如需扩展更多 JS 动态页面抓取，可参考 fetch_js_ips 函数实现

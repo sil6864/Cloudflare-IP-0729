@@ -2,4 +2,5 @@ requests
 beautifulsoup4
 playwright
 pyyaml
-aiohttp 
+aiohttp
+ipaddress 
